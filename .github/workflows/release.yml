@@ -23,7 +23,7 @@ jobs:
     runs-on: macos-14
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-      UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY }}
+      UPDATE_SIGNING_KEY_BASE64: ${{ secrets.UPDATE_SIGNING_KEY_BASE64 }}
     steps:
       - name: Check out release source
         uses: actions/checkout@v4
@@ -97,8 +97,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "$UPDATE_SIGNING_PRIVATE_KEY" ]]; then
-            echo "UPDATE_SIGNING_PRIVATE_KEY repository secret is required" >&2
+          if [[ -z "$UPDATE_SIGNING_KEY_BASE64" ]]; then
+            echo "UPDATE_SIGNING_KEY_BASE64 repository secret is required" >&2
             exit 1
           fi
           python3 scripts/generate-update-manifest.py \
@@ -106,14 +106,8 @@ jobs:
             --version "${{ steps.version.outputs.version }}" \
             --asset "${{ steps.archive.outputs.asset }}" \
             --output update-manifest.json
-          key_file=$(mktemp)
-          trap 'rm -f "$key_file"' EXIT
-          printf '%s' "$UPDATE_SIGNING_PRIVATE_KEY" > "$key_file"
-          chmod 600 "$key_file"
-          openssl pkeyutl -sign -rawin \
-            -inkey "$key_file" \
-            -in update-manifest.json \
-            -out update-manifest.json.sig
+          cargo run --quiet --bin sign-update -- \
+            update-manifest.json update-manifest.json.sig
           test "$(stat -f '%z' update-manifest.json.sig)" = 64
 
       - name: Publish GitHub release

@@ -72,7 +72,7 @@ git tag v0.2.0
 git push origin main v0.2.0
 ```
 
-manifest 개인키는 저장소 파일이 아니라 `UPDATE_SIGNING_PRIVATE_KEY` Actions secret으로만 관리합니다.
+manifest 개인키 seed는 저장소 파일이 아니라 `UPDATE_SIGNING_KEY_BASE64` Actions secret으로만 관리합니다.
 macOS 앱 자체는 현재 ad-hoc 코드 서명됩니다. 다른 Mac에 경고 없는 공개 배포를 하려면 Developer ID
 Application 서명과 Apple notarization 단계를 추가로 구성해야 합니다.
 
