@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  macos-universal:
+  macos-arm64:
     runs-on: macos-14
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
@@ -43,35 +43,20 @@ jobs:
           fi
           echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
 
-      - name: Add Universal 2 Rust targets
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Add Apple Silicon Rust target
+        run: rustup target add aarch64-apple-darwin
 
       - name: Test
         run: cargo test --all-targets
 
-      - name: Build both macOS architectures
-        shell: bash
-        run: |
-          set -euo pipefail
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --target "$target" --bin pocket-ytm --bin pocket-ytm-updater
-          done
-
-      - name: Create Universal 2 binaries
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/universal-release
-          for binary in pocket-ytm pocket-ytm-updater; do
-            lipo -create \
-              "target/aarch64-apple-darwin/release/$binary" \
-              "target/x86_64-apple-darwin/release/$binary" \
-              -output "target/universal-release/$binary"
-          done
+      - name: Build Apple Silicon release
+        run: >-
+          cargo build --release --target aarch64-apple-darwin
+          --bin pocket-ytm --bin pocket-ytm-updater
 
       - name: Package app bundle
         env:
-          POCKET_YTM_BINARY_DIR: ${{ github.workspace }}/target/universal-release
+          POCKET_YTM_BINARY_DIR: ${{ github.workspace }}/target/aarch64-apple-darwin/release
           POCKET_YTM_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/package-macos.sh
 
@@ -81,15 +66,15 @@ jobs:
           set -euo pipefail
           codesign --verify --deep --strict --verbose=2 "dist/Pocket Music.app"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 'dist/Pocket Music.app/Contents/Info.plist')" = "${{ steps.version.outputs.version }}"
-          lipo "dist/Pocket Music.app/Contents/MacOS/pocket-ytm" -verify_arch arm64 x86_64
-          lipo "dist/Pocket Music.app/Contents/MacOS/pocket-ytm-updater" -verify_arch arm64 x86_64
+          lipo "dist/Pocket Music.app/Contents/MacOS/pocket-ytm" -verify_arch arm64
+          lipo "dist/Pocket Music.app/Contents/MacOS/pocket-ytm-updater" -verify_arch arm64
 
       - name: Archive app
         id: archive
         shell: bash
         run: |
           set -euo pipefail
-          asset="Pocket-Music-v${{ steps.version.outputs.version }}-macos-universal.zip"
+          asset="Pocket-Music-v${{ steps.version.outputs.version }}-macos-aarch64.zip"
           ditto -c -k --sequesterRsrc --keepParent "dist/Pocket Music.app" "$asset"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 

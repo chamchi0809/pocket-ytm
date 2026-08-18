@@ -323,7 +323,7 @@ fn parse_version(value: &str) -> Result<Version> {
 
 fn current_platform() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64" | "x86_64") => Ok("macos-universal"),
+        ("macos", "aarch64") => Ok("macos-aarch64"),
         (os, arch) => bail!("자동 업데이트가 아직 지원되지 않는 시스템입니다: {os}-{arch}"),
     }
 }

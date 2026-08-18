@@ -29,16 +29,20 @@ def main() -> None:
         f"https://github.com/{args.repository}/releases/download/"
         f"{quote(tag, safe='')}/{quote(asset.name, safe='')}"
     )
+    platform_asset = {
+        "url": asset_url,
+        "sha256": digest.hexdigest(),
+        "size": asset.stat().st_size,
+    }
     manifest = {
         "schemaVersion": 1,
         "version": args.version,
         "repository": args.repository,
         "platforms": {
-            "macos-universal": {
-                "url": asset_url,
-                "sha256": digest.hexdigest(),
-                "size": asset.stat().st_size,
-            }
+            "macos-aarch64": platform_asset,
+            # v0.1.0 clients used this key. Keep it as a one-way compatibility
+            # bridge so existing Apple Silicon installs can reach v0.1.1+.
+            "macos-universal": platform_asset,
         },
     }
     args.output.write_text(

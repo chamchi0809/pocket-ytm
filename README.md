@@ -62,7 +62,7 @@ macOS `.app` 번들은 다음 명령으로 만듭니다. 결과물은 `dist/Pock
 - 압축 경로 순회 차단과 bundle ID·앱 버전 확인
 - macOS 코드 서명 확인
 
-GitHub Actions의 `Release` workflow는 `Cargo.toml` 버전과 같은 태그를 push하면 Universal 2 앱,
+GitHub Actions의 `Release` workflow는 `Cargo.toml` 버전과 같은 태그를 push하면 Apple Silicon 앱,
 서명된 manifest, GitHub Release를 자동 생성합니다.
 
 ```sh
