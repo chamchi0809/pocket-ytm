@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  macos-universal:
+    runs-on: macos-14
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          tag_version=${RELEASE_TAG#v}
+          if [[ "$cargo_version" != "$tag_version" ]]; then
+            echo "Cargo version $cargo_version does not match tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+      - name: Add Universal 2 Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build both macOS architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$target" --bin pocket-ytm --bin pocket-ytm-updater
+          done
+
+      - name: Create Universal 2 binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/universal-release
+          for binary in pocket-ytm pocket-ytm-updater; do
+            lipo -create \
+              "target/aarch64-apple-darwin/release/$binary" \
+              "target/x86_64-apple-darwin/release/$binary" \
+              -output "target/universal-release/$binary"
+          done
+
+      - name: Package app bundle
+        env:
+          POCKET_YTM_BINARY_DIR: ${{ github.workspace }}/target/universal-release
+          POCKET_YTM_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/package-macos.sh
+
+      - name: Verify app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=2 "dist/Pocket Music.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 'dist/Pocket Music.app/Contents/Info.plist')" = "${{ steps.version.outputs.version }}"
+          lipo "dist/Pocket Music.app/Contents/MacOS/pocket-ytm" -verify_arch arm64 x86_64
+          lipo "dist/Pocket Music.app/Contents/MacOS/pocket-ytm-updater" -verify_arch arm64 x86_64
+
+      - name: Archive app
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="Pocket-Music-v${{ steps.version.outputs.version }}-macos-universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/Pocket Music.app" "$asset"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Generate signed update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$UPDATE_SIGNING_PRIVATE_KEY" ]]; then
+            echo "UPDATE_SIGNING_PRIVATE_KEY repository secret is required" >&2
+            exit 1
+          fi
+          python3 scripts/generate-update-manifest.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --version "${{ steps.version.outputs.version }}" \
+            --asset "${{ steps.archive.outputs.asset }}" \
+            --output update-manifest.json
+          key_file=$(mktemp)
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s' "$UPDATE_SIGNING_PRIVATE_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          openssl pkeyutl -sign -rawin \
+            -inkey "$key_file" \
+            -in update-manifest.json \
+            -out update-manifest.json.sig
+          test "$(stat -f '%z' update-manifest.json.sig)" = 64
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              "${{ steps.archive.outputs.asset }}" \
+              update-manifest.json \
+              update-manifest.json.sig \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              "${{ steps.archive.outputs.asset }}" \
+              update-manifest.json \
+              update-manifest.json.sig \
+              --verify-tag \
+              --generate-notes \
+              --title "Pocket Music $RELEASE_TAG"
+          fi

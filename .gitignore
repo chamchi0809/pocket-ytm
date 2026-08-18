@@ -1,0 +1,14 @@
+/target
+/.venv
+/.idea
+*.log
+.env
+*.p12
+update-signing-key.pem
+.DS_Store
+auth.json
+oauth.json
+cookies.txt
+__pycache__/
+*.pyc
+/dist
