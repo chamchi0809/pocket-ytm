@@ -46,8 +46,15 @@ jobs:
       - name: Add Apple Silicon Rust target
         run: rustup target add aarch64-apple-darwin
 
+      - name: Install Python bridge dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt
+
       - name: Test
-        run: cargo test --all-targets
+        run: |
+          cargo test --all-targets
+          (cd backend && ../.venv/bin/python -m unittest test_ytmusic_bridge.py)
 
       - name: Build Apple Silicon release
         run: >-

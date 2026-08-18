@@ -1,8 +1,9 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, Context, Entity, Focusable as _, IntoElement, ObjectFit, Render, SharedString,
-    StyledImage as _, Task, Timer, Window, div, img, prelude::*, px, relative, rgb,
+    AnyElement, Context, Entity, Focusable as _, IntoElement, MouseButton, MouseMoveEvent,
+    ObjectFit, Render, SharedString, StyledImage as _, Task, Timer, Window, div, img, prelude::*,
+    px, relative, rgb,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 
@@ -56,6 +57,7 @@ pub struct PocketYtmApp {
     detail: Option<BrowsePage>,
     loading: bool,
     error: Option<String>,
+    sidebar_playlists: Vec<MediaItem>,
     queue: Vec<MediaItem>,
     queue_index: usize,
     show_queue: bool,
@@ -66,7 +68,9 @@ pub struct PocketYtmApp {
     repeat: RepeatMode,
     liked: HashSet<String>,
     audio_snapshot: AudioSnapshot,
+    seek_drag_fraction: Option<f64>,
     last_ended_generation: Option<u64>,
+    watch_queue_request: u64,
     updater: Option<UpdateClient>,
     update_state: UpdateState,
     show_update: bool,
@@ -133,6 +137,7 @@ impl PocketYtmApp {
             detail: None,
             loading: false,
             error: None,
+            sidebar_playlists: vec![],
             queue: vec![],
             queue_index: 0,
             show_queue: false,
@@ -142,7 +147,9 @@ impl PocketYtmApp {
             shuffle: false,
             repeat: RepeatMode::Off,
             liked: HashSet::new(),
+            seek_drag_fraction: None,
             last_ended_generation: None,
+            watch_queue_request: 0,
             updater: UpdateClient::new()
                 .map_err(|error| {
                     log::warn!("update client unavailable: {error:#}");
@@ -284,7 +291,13 @@ impl PocketYtmApp {
                 entity
                     .update(cx, |this, cx| {
                         if let Ok(status) = result {
+                            let authenticated = status.authenticated;
                             this.auth_status = status;
+                            if authenticated {
+                                this.load_sidebar_playlists(cx);
+                            } else {
+                                this.sidebar_playlists.clear();
+                            }
                             cx.notify();
                         }
                     })
@@ -323,6 +336,7 @@ impl PocketYtmApp {
                             Ok(status) => {
                                 this.auth_status = status;
                                 this.auth_message = Some("로그인되었습니다.".into());
+                                this.load_sidebar_playlists(cx);
                                 this.load_home(cx);
                             }
                             Err(error) => {
@@ -356,6 +370,7 @@ impl PocketYtmApp {
                             Ok(status) => {
                                 this.auth_status = status;
                                 this.auth_message = Some("로그아웃되었습니다.".into());
+                                this.sidebar_playlists.clear();
                                 this.load_home(cx);
                             }
                             Err(error) => {
@@ -369,6 +384,38 @@ impl PocketYtmApp {
         })
         .detach();
         cx.notify();
+    }
+
+    fn load_sidebar_playlists(&mut self, cx: &mut Context<Self>) {
+        if !self.auth_status.authenticated {
+            self.sidebar_playlists.clear();
+            return;
+        }
+        let backend = self.backend.clone();
+        let task = cx.background_spawn(async move { backend.library("playlists") });
+        cx.spawn(async move |weak, cx| {
+            let result = task.await;
+            if let Some(entity) = weak.upgrade() {
+                entity
+                    .update(cx, |this, cx| {
+                        match result {
+                            Ok(sections) => {
+                                this.sidebar_playlists = sections
+                                    .into_iter()
+                                    .flat_map(|section| section.items)
+                                    .filter(|item| item.kind == "playlist")
+                                    .collect();
+                            }
+                            Err(error) => {
+                                log::warn!("sidebar playlists unavailable: {error:#}");
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
     }
 
     fn open_music_login(&mut self, cx: &mut Context<Self>) {
@@ -424,12 +471,53 @@ impl PocketYtmApp {
         self.play_next(false);
     }
 
+    fn seek_to_fraction(&mut self, fraction: f64) {
+        let duration = self.audio_snapshot.duration;
+        if duration.is_zero()
+            || matches!(
+                self.audio_snapshot.phase,
+                PlaybackPhase::Idle | PlaybackPhase::Loading | PlaybackPhase::Error
+            )
+        {
+            return;
+        }
+        let position = duration.mul_f64(fraction.clamp(0.0, 1.0));
+        self.audio_snapshot.position = position;
+        self.audio.seek(position);
+    }
+
+    fn begin_seek_drag(&mut self, fraction: f64) {
+        if !self.audio_snapshot.duration.is_zero()
+            && !matches!(
+                self.audio_snapshot.phase,
+                PlaybackPhase::Idle | PlaybackPhase::Loading | PlaybackPhase::Error
+            )
+        {
+            self.seek_drag_fraction = Some(fraction.clamp(0.0, 1.0));
+        }
+    }
+
+    fn finish_seek_drag(&mut self, fraction: Option<f64>) {
+        let target = fraction
+            .or(self.seek_drag_fraction)
+            .map(|value| value.clamp(0.0, 1.0));
+        self.seek_drag_fraction = None;
+        if let Some(target) = target {
+            self.seek_to_fraction(target);
+        }
+    }
+
     fn previous(&mut self) {
-        if self.audio_snapshot.position > Duration::from_secs(4) {
+        let snapshot_matches_queue = self
+            .audio_snapshot
+            .item
+            .as_ref()
+            .zip(self.queue.get(self.queue_index))
+            .is_some_and(|(playing, queued)| same_track(playing, queued));
+        if snapshot_matches_queue && self.audio_snapshot.position > Duration::from_secs(4) {
             self.audio.seek(Duration::ZERO);
         } else if !self.queue.is_empty() {
-            self.queue_index = self.queue_index.saturating_sub(1);
-            self.audio.load(self.queue[self.queue_index].clone());
+            self.start_queue_track(self.queue_index.saturating_sub(1));
         }
     }
 
@@ -586,6 +674,56 @@ impl PocketYtmApp {
         cx.notify();
     }
 
+    fn play_playlist(&mut self, playlist: MediaItem, cx: &mut Context<Self>) {
+        let Some(playlist_id) = playlist
+            .playlist_id
+            .clone()
+            .or_else(|| playlist.browse_id.clone())
+        else {
+            self.error = Some("이 플레이리스트의 ID를 찾지 못했습니다.".into());
+            cx.notify();
+            return;
+        };
+        self.page = Page::Detail;
+        self.detail = None;
+        self.loading = true;
+        self.error = None;
+        let backend = self.backend.clone();
+        let task = cx.background_spawn(async move { backend.playlist_queue(&playlist_id) });
+        cx.spawn(async move |weak, cx| {
+            let result = task.await;
+            if let Some(entity) = weak.upgrade() {
+                entity
+                    .update(cx, |this, cx| {
+                        this.loading = false;
+                        match result {
+                            Ok(watch) => {
+                                let queue: Vec<_> = watch
+                                    .items
+                                    .into_iter()
+                                    .filter(MediaItem::playable)
+                                    .collect();
+                                let first = queue.first().cloned();
+                                if let Some(first) = first {
+                                    this.play_item(first, queue, cx);
+                                    this.browse(playlist.clone(), cx);
+                                } else {
+                                    this.error = Some(
+                                        "이 플레이리스트에는 재생 가능한 곡이 없습니다.".into(),
+                                    );
+                                }
+                            }
+                            Err(error) => this.error = Some(format!("{error:#}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn play_item(&mut self, item: MediaItem, source_queue: Vec<MediaItem>, cx: &mut Context<Self>) {
         if !item.playable() {
             self.browse(item, cx);
@@ -598,24 +736,28 @@ impl PocketYtmApp {
         if queue.is_empty() {
             queue.push(item.clone());
         }
-        self.queue_index = queue
+        let queue_index = queue
             .iter()
-            .position(|candidate| candidate.id == item.id)
+            .position(|candidate| same_track(candidate, &item))
             .unwrap_or(0);
+        let replace_with_watch_queue = queue.len() == 1;
         self.queue = queue;
-        self.audio.load(item.clone());
-        self.lyrics = None;
-        self.lyrics_browse_id = None;
-        self.last_ended_generation = None;
-        self.hydrate_watch_queue(item, cx);
+        self.start_queue_track(queue_index);
+        self.hydrate_watch_queue(item, replace_with_watch_queue, cx);
         cx.notify();
     }
 
-    fn hydrate_watch_queue(&mut self, current: MediaItem, cx: &mut Context<Self>) {
+    fn hydrate_watch_queue(
+        &mut self,
+        current: MediaItem,
+        replace_queue: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(video_id) = current.video_id.clone() else {
             return;
         };
-        let current_id = current.id.clone();
+        self.watch_queue_request = self.watch_queue_request.wrapping_add(1);
+        let request_id = self.watch_queue_request;
         let backend = self.backend.clone();
         let task = cx.background_spawn(async move { backend.watch_queue(&video_id) });
         cx.spawn(async move |weak, cx| {
@@ -623,17 +765,28 @@ impl PocketYtmApp {
             if let Some(entity) = weak.upgrade() {
                 entity
                     .update(cx, |this, cx| {
+                        let still_current = this
+                            .queue
+                            .get(this.queue_index)
+                            .is_some_and(|queued| same_track(queued, &current));
+                        if this.watch_queue_request != request_id || !still_current {
+                            return;
+                        }
                         if let Ok(watch) = result {
                             this.lyrics_browse_id = watch.lyrics_browse_id;
-                            if !watch.items.is_empty() {
-                                this.queue_index = watch
+                            if replace_queue
+                                && let Some(index) = watch
                                     .items
                                     .iter()
-                                    .position(|item| item.id == current_id)
-                                    .unwrap_or(0);
+                                    .position(|item| same_track(item, &current))
+                            {
+                                this.queue_index = index;
                                 this.queue = watch.items;
                             }
+                            this.prefetch_queue_neighbors();
                             cx.notify();
+                        } else if let Err(error) = result {
+                            log::debug!("watch queue hydration unavailable: {error:#}");
                         }
                     })
                     .ok();
@@ -647,21 +800,64 @@ impl PocketYtmApp {
             return;
         }
         if automatic && self.repeat == RepeatMode::One {
-            self.audio.load(self.queue[self.queue_index].clone());
+            self.start_queue_track(self.queue_index);
             return;
         }
-        if self.shuffle && self.queue.len() > 1 {
-            self.queue_index = (self.queue_index * 7 + 3) % self.queue.len();
+        let next_index = if self.shuffle && self.queue.len() > 1 {
+            (self.queue_index * 7 + 3) % self.queue.len()
         } else if self.queue_index + 1 < self.queue.len() {
-            self.queue_index += 1;
+            self.queue_index + 1
         } else if self.repeat == RepeatMode::All {
-            self.queue_index = 0;
+            0
         } else {
             return;
-        }
-        self.audio.load(self.queue[self.queue_index].clone());
+        };
+        self.start_queue_track(next_index);
+    }
+
+    fn start_queue_track(&mut self, index: usize) {
+        let Some(item) = self.queue.get(index).cloned() else {
+            return;
+        };
+        self.queue_index = index;
+        // Consume the last snapshot generation before requesting a new one. If the
+        // previous source reaches Ended while Load is crossing the audio channel,
+        // update_audio must not interpret it as another automatic-next event.
+        self.last_ended_generation = Some(self.audio_snapshot.generation);
+        self.watch_queue_request = self.watch_queue_request.wrapping_add(1);
+        self.audio.load(item);
         self.lyrics = None;
         self.lyrics_browse_id = None;
+        self.prefetch_queue_neighbors();
+    }
+
+    fn prefetch_queue_neighbors(&self) {
+        if self.queue.len() < 2 {
+            self.audio.prefetch(vec![]);
+            return;
+        }
+        let mut indices = Vec::with_capacity(2);
+        if self.queue_index + 1 < self.queue.len() {
+            indices.push(self.queue_index + 1);
+        } else if self.repeat == RepeatMode::All {
+            indices.push(0);
+        }
+        if self.queue_index > 0 {
+            indices.push(self.queue_index - 1);
+        } else if self.repeat == RepeatMode::All {
+            indices.push(self.queue.len() - 1);
+        }
+        let mut seen = HashSet::new();
+        let items = indices
+            .into_iter()
+            .filter_map(|index| self.queue.get(index).cloned())
+            .filter(MediaItem::playable)
+            .filter(|item| {
+                let identity = item.video_id.as_deref().unwrap_or(&item.id);
+                seen.insert(identity.to_owned())
+            })
+            .collect();
+        self.audio.prefetch(items);
     }
 
     fn toggle_lyrics(&mut self, cx: &mut Context<Self>) {
@@ -767,6 +963,66 @@ impl PocketYtmApp {
                 .into_any_element()
         };
 
+        let playlist_rows = self
+            .sidebar_playlists
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(index, playlist)| {
+                let row_playlist = playlist.clone();
+                div()
+                    .id(SharedString::from(format!("sidebar-playlist-{index}")))
+                    .group("sidebar-playlist")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_h(px(46.))
+                    .px_2()
+                    .py_2()
+                    .rounded_lg()
+                    .hover(|style| style.bg(rgb(0x252529)))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(26.))
+                            .rounded_md()
+                            .bg(rgb(0x29292d))
+                            .text_size(px(10.))
+                            .text_color(rgb(0xb9b9bf))
+                            .child("▶"),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(0xe4e4e7))
+                                    .child(playlist.title),
+                            )
+                            .when(!playlist.subtitle.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .mt_1()
+                                        .truncate()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(0x77777e))
+                                        .child(playlist.subtitle),
+                                )
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.play_playlist(row_playlist.clone(), cx)
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
         div()
             .flex()
             .flex_col()
@@ -809,7 +1065,29 @@ impl PocketYtmApp {
             .child(nav("홈", Page::Home, "⌂", cx))
             .child(nav("둘러보기", Page::Explore, "◉", cx))
             .child(nav("보관함", Page::Library, "▤", cx))
-            .child(div().flex_1())
+            .when(self.auth_status.authenticated, |this| {
+                this.child(div().mt_4().mb_3().border_t_1().border_color(rgb(0x303034)))
+                    .child(
+                        div()
+                            .px_2()
+                            .mb_2()
+                            .text_size(px(11.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x85858c))
+                            .child("내 플레이리스트"),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-playlists-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .children(playlist_rows),
+                    )
+            })
+            .when(!self.auth_status.authenticated, |this| {
+                this.child(div().flex_1())
+            })
             .child(
                 div()
                     .px_2()
@@ -926,6 +1204,10 @@ impl PocketYtmApp {
         if let Some(url) = &item.thumbnail {
             let image = img(url.clone())
                 .size(px(size))
+                .max_w(px(size))
+                .max_h(px(size))
+                .rounded(px(rounded))
+                .overflow_hidden()
                 .object_fit(ObjectFit::Cover)
                 .with_loading(move || {
                     div()
@@ -981,9 +1263,12 @@ impl PocketYtmApp {
             )))
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .w(px(168.))
+            .max_w(px(168.))
             .p_2()
             .rounded_xl()
+            .overflow_hidden()
             .hover(|style| style.bg(rgb(0x222226)))
             .cursor_pointer()
             .child(Self::artwork(
@@ -1351,8 +1636,7 @@ impl PocketYtmApp {
                                 .iter()
                                 .position(|candidate| candidate.id == queued_id)
                             {
-                                this.queue_index = index;
-                                this.audio.load(this.queue[index].clone());
+                                this.start_queue_track(index);
                             }
                         }))
                         .into_any_element(),
@@ -1972,24 +2256,48 @@ impl PocketYtmApp {
             .video_id
             .as_ref()
             .is_some_and(|id| self.liked.contains(id));
-        let ratio = if state.duration.is_zero() {
+        let playback_ratio = if state.duration.is_zero() {
             0.0
         } else {
             (state.position.as_secs_f64() / state.duration.as_secs_f64()).clamp(0.0, 1.0)
         };
+        let ratio = self.seek_drag_fraction.unwrap_or(playback_ratio);
+        let displayed_position = self
+            .seek_drag_fraction
+            .map(|fraction| state.duration.mul_f64(fraction))
+            .unwrap_or(state.position);
         let mut seek_targets = Vec::new();
-        for index in 0..64 {
-            let fraction = (index + 1) as f64 / 64.0;
+        for index in 0..128 {
+            let fraction = (index as f64 + 0.5) / 128.0;
             seek_targets.push(
                 div()
                     .id(SharedString::from(format!("seek-{index}")))
-                    .h(px(4.))
+                    .h(px(14.))
                     .flex_1()
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, _| {
-                        let duration = this.audio_snapshot.duration;
-                        this.audio.seek(duration.mul_f64(fraction));
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.begin_seek_drag(fraction);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                        if event.dragging() {
+                            cx.stop_propagation();
+                            this.begin_seek_drag(fraction);
+                            cx.notify();
+                        }
                     }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.finish_seek_drag(Some(fraction));
+                            cx.notify();
+                        }),
+                    )
                     .into_any_element(),
             );
         }
@@ -1999,23 +2307,43 @@ impl PocketYtmApp {
             .left_0()
             .right_0()
             .bottom_0()
-            .h(px(104.))
+            .h(px(112.))
+            .occlude()
             .bg(rgb(0x1b1b1e))
             .border_t_1()
             .border_color(rgb(0x34343a))
             .shadow_lg()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.seek_drag_fraction.is_some() {
+                        cx.stop_propagation();
+                        this.finish_seek_drag(None);
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 div()
                     .id("player-progress")
                     .relative()
-                    .h(px(4.))
-                    .bg(rgb(0x424248))
+                    .h(px(14.))
+                    .cursor_pointer()
                     .child(
                         div()
                             .absolute()
                             .left_0()
-                            .top_0()
-                            .bottom_0()
+                            .top(px(5.))
+                            .h(px(4.))
+                            .w_full()
+                            .bg(rgb(0x424248)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(5.))
+                            .h(px(4.))
                             .w(relative(ratio as f32))
                             .bg(rgb(0xff3157)),
                     )
@@ -2025,7 +2353,7 @@ impl PocketYtmApp {
                 div()
                     .flex()
                     .items_center()
-                    .h(px(99.))
+                    .h(px(97.))
                     .px_5()
                     .child(
                         div()
@@ -2162,7 +2490,7 @@ impl PocketYtmApp {
                             .child(div().text_size(px(10.)).text_color(rgb(0x77777e)).child(
                                 format!(
                                     "{}  /  {}",
-                                    format_time(state.position.as_secs()),
+                                    format_time(displayed_position.as_secs()),
                                     format_time(state.duration.as_secs())
                                 ),
                             )),
@@ -2294,14 +2622,37 @@ fn format_time(seconds: u64) -> String {
     }
 }
 
+fn same_track(left: &MediaItem, right: &MediaItem) -> bool {
+    match (&left.video_id, &right.video_id) {
+        (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => left == right,
+        _ => left.id == right.id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_time;
+    use super::{format_time, same_track};
+    use crate::model::MediaItem;
 
     #[test]
     fn time_format_matches_player_conventions() {
         assert_eq!(format_time(0), "0:00");
         assert_eq!(format_time(65), "1:05");
         assert_eq!(format_time(3661), "1:01:01");
+    }
+
+    #[test]
+    fn queue_identity_prefers_video_id() {
+        let left = MediaItem {
+            id: "row-a".into(),
+            video_id: Some("video".into()),
+            ..Default::default()
+        };
+        let right = MediaItem {
+            id: "row-b".into(),
+            video_id: Some("video".into()),
+            ..Default::default()
+        };
+        assert!(same_track(&left, &right));
     }
 }

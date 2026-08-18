@@ -94,6 +94,13 @@ impl YtMusicBridge {
         self.request("watch", json!({"videoId": video_id, "limit": 50}))
     }
 
+    pub fn playlist_queue(&self, playlist_id: &str) -> Result<WatchQueue> {
+        self.request(
+            "playlistQueue",
+            json!({"playlistId": playlist_id, "limit": 50}),
+        )
+    }
+
     pub fn lyrics(&self, browse_id: &str) -> Result<Lyrics> {
         self.request("lyrics", json!({"browseId": browse_id}))
     }

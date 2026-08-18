@@ -2,8 +2,9 @@
 
 GPUI로 직접 그리는 크로스플랫폼 YouTube Music 클라이언트입니다. 화면에는 DOM/WebView가 없고,
 Chromium을 번들하지 않습니다. 오디오는 HTML `<audio>` 대신 `yt-dlp`의 stdout을 FFmpeg에서
-일관된 PCM/WAV로 정규화하고 seek 가능한 임시 캐시에 스트리밍한 뒤 rodio/CPAL을 통해 OS 오디오
-장치로 보냅니다.
+일관된 PCM/WAV로 정규화하고 seek 가능한 앱 세션 임시 캐시에 청크 단위로 스트리밍한 뒤
+rodio/CPAL을 통해 OS 오디오 장치로 보냅니다. 이 캐시는 앱을 종료하면 삭제되며 다음 실행으로
+영구 보존되지 않습니다.
 
 ## 구현된 코어 기능
 
@@ -11,6 +12,7 @@ Chromium을 번들하지 않습니다. 오디오는 HTML `<audio>` 대신 `yt-dl
 - 앨범·아티스트·플레이리스트 상세 탐색
 - 로그인 사용자의 노래·앨범·아티스트·플레이리스트 보관함
 - 네이티브 백그라운드 재생, 일시정지, seek, 이전/다음, 볼륨
+- 현재 세션의 트랙 캐시와 다음·이전 트랙 백그라운드 prefetch
 - YouTube Music 라디오 큐, 자동 다음 곡, 셔플, 한 곡/전체 반복
 - 가사 패널과 곡 좋아요
 - 원격 썸네일의 네이티브 GPUI 렌더링
@@ -27,7 +29,7 @@ Rust 쪽에 YouTube 응답 형식을 노출할 필요가 없습니다.
 GPUI native UI
     ├── ytmusicapi sidecar (stdin/stdout NDJSON) ── 탐색·계정·라이브러리
     └── native audio thread
-            └── yt-dlp stdout ── FFmpeg PCM/WAV ── temp seek cache ── rodio/CPAL ── OS audio
+            └── yt-dlp stdout ── FFmpeg PCM/WAV ── session seek cache ── rodio/CPAL ── OS audio
 ```
 
 `gpui-component`의 WebView feature를 비활성화했고 `wry`/Chromium은 의존성에 포함되지 않습니다.
@@ -148,8 +150,7 @@ Rust MSVC toolchain과 WebView가 아닌 네이티브 GPUI/CPAL 경로를 사용
 ```sh
 cargo fmt --all -- --check
 cargo test
-cargo test audio::tests::yt_dlp_stream_reaches_native_decoder -- --ignored
-python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("backend/ytmusic_bridge.py").read_text())'
+(cd backend && ../.venv/bin/python -m unittest test_ytmusic_bridge.py)
 ```
 
 ## 현실적인 호환성 경계

@@ -31,6 +31,9 @@ actions!(
 );
 
 fn main() {
+    if let Some(exit_code) = audio::maybe_run_media_stream() {
+        std::process::exit(exit_code);
+    }
     env_logger::init();
     let config = AppConfig::from_env();
     let bridge = YtMusicBridge::new(config.clone());

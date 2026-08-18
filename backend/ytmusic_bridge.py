@@ -142,6 +142,13 @@ def infer_kind(raw: dict[str, Any], fallback: str = "unknown") -> str:
     kind = raw.get("resultType") or raw.get("type") or fallback
     if kind == "profile":
         return "artist"
+    browse_id = text(raw.get("browseId"))
+    playlist_id = text(raw.get("playlistId"))
+    # Explore's new-release cards sometimes omit resultType and expose an album
+    # as a watch-playlist id such as VLMPRE.... Treating that id as a regular
+    # playlist makes ytmusicapi parse an album response with the playlist schema.
+    if browse_id.startswith(("MPRE", "VLMPRE")) or playlist_id.startswith(("MPRE", "VLMPRE")):
+        return "album"
     if raw.get("videoId") and kind in ("unknown", "watch"):
         return "song"
     if raw.get("playlistId") and kind == "unknown":
@@ -156,6 +163,12 @@ def normalize_item(raw: Any, fallback_kind: str = "unknown") -> dict[str, Any] |
     video_id = raw.get("videoId")
     browse_id = raw.get("browseId")
     playlist_id = raw.get("playlistId")
+    if kind in ("album", "single"):
+        album_id = text(browse_id or playlist_id)
+        if album_id.startswith("VLMPRE"):
+            album_id = album_id[2:]
+        if album_id.startswith("MPRE"):
+            browse_id = album_id
     if not browse_id:
         browse_id = raw.get("channelId")
     artist_values = raw.get("artists") if isinstance(raw.get("artists"), list) else []
@@ -194,7 +207,9 @@ def normalize_item(raw: Any, fallback_kind: str = "unknown") -> dict[str, Any] |
         "browseId": browse_id,
         "playlistId": playlist_id,
         "thumbnail": thumbnail(raw),
-        "durationSeconds": parse_duration(raw.get("duration_seconds") or raw.get("duration")),
+        "durationSeconds": parse_duration(
+            raw.get("duration_seconds") or raw.get("duration") or raw.get("length")
+        ),
         "explicit": bool(raw.get("isExplicit") or raw.get("explicit")),
     }
 
@@ -401,14 +416,14 @@ class Service:
             limit = int(params.get("limit", 100))
             category = params.get("category", "all")
             sections: list[dict[str, Any]] = []
+            if category in ("all", "playlists"):
+                sections.append({"title": "플레이리스트", "subtitle": "", "items": normalize_items(self.yt.get_library_playlists(limit=limit), "playlist")})
             if category in ("all", "songs"):
                 sections.append({"title": "보관함의 노래", "subtitle": "", "items": normalize_items(self.yt.get_library_songs(limit=limit), "song")})
             if category in ("all", "albums"):
                 sections.append({"title": "앨범", "subtitle": "", "items": normalize_items(self.yt.get_library_albums(limit=limit), "album")})
             if category in ("all", "artists"):
                 sections.append({"title": "아티스트", "subtitle": "", "items": normalize_items(self.yt.get_library_artists(limit=limit), "artist")})
-            if category in ("all", "playlists"):
-                sections.append({"title": "플레이리스트", "subtitle": "", "items": normalize_items(self.yt.get_library_playlists(limit=limit), "playlist")})
             return [section for section in sections if section["items"]]
         if op == "watch":
             raw = self.yt.get_watch_playlist(
@@ -416,6 +431,16 @@ class Service:
             )
             return {
                 "playlistId": raw.get("playlistId"),
+                "lyricsBrowseId": raw.get("lyrics"),
+                "items": normalize_items(raw.get("tracks"), "song"),
+            }
+        if op == "playlistQueue":
+            self.require_auth()
+            raw = self.yt.get_watch_playlist(
+                playlistId=params["playlistId"], limit=int(params.get("limit", 50))
+            )
+            return {
+                "playlistId": raw.get("playlistId") or params["playlistId"],
                 "lyricsBrowseId": raw.get("lyrics"),
                 "items": normalize_items(raw.get("tracks"), "song"),
             }
@@ -428,7 +453,7 @@ class Service:
             elif kind in ("album", "single"):
                 raw = self.yt.get_album(browse_id)
             else:
-                raw = self.yt.get_playlist(playlist_id or browse_id, limit=None)
+                raw = self.yt.get_playlist(playlist_id or browse_id, limit=100)
             return detail_page(raw, kind)
         if op == "lyrics":
             raw = self.yt.get_lyrics(params["browseId"], timestamps=False) or {}
