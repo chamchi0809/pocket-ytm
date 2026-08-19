@@ -377,7 +377,7 @@ impl PocketYtmApp {
         self.auth_busy = true;
         self.quick_login_busy = true;
         self.auth_message =
-            Some("Chrome에서 로그인하세요. 완료를 감지하면 앱이 자동으로 연결합니다.".into());
+            Some("Chrome에서 로그인하세요. 감지가 늦으면 로그인 창을 완전히 닫아 주세요.".into());
         let backend = self.backend.clone();
         let task = cx.background_spawn(async move { backend.quick_login() });
         cx.spawn(async move |weak, cx| {
@@ -2108,7 +2108,18 @@ impl PocketYtmApp {
                                 .text_size(px(11.))
                                 .line_height(px(17.))
                                 .text_color(rgb(0xa8a8ae))
-                                .child("자동화 옵션 없는 전용 Chrome 창에서 로그인하세요. 완료를 감지하면 앱이 창을 닫고 로그인 정보를 연결한 뒤 임시 프로필을 삭제합니다."),
+                                .child("자동화 옵션 없는 전용 Chrome 창에서 로그인하세요. 앱이 완료를 감지해 자동 연결합니다. 계속 기다리면 로그인 창을 완전히 닫아 주세요."),
+                        )
+                        .child(
+                            div()
+                                .mt_3()
+                                .p_3()
+                                .rounded_lg()
+                                .bg(rgb(0x30272a))
+                                .text_size(px(11.))
+                                .line_height(px(17.))
+                                .text_color(rgb(0xe1b5bd))
+                                .child("YouTube Music 로그인은 Premium 계정만 지원합니다. 비로그인 상태에서는 YouTube 정책에 따라 일부 영상 재생이 제한될 수 있습니다."),
                         )
                         .child(
                             div()

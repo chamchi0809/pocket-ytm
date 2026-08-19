@@ -111,6 +111,28 @@ class LibraryOrderingTests(unittest.TestCase):
         self.assertEqual(sections[0]["title"], "플레이리스트")
 
 
+class UnauthenticatedFallbackTests(unittest.TestCase):
+    def test_explore_parser_failure_uses_search_fallback_when_logged_out(self) -> None:
+        class FakeYtMusic:
+            @staticmethod
+            def get_explore():
+                raise AttributeError("'NoneType' object has no attribute 'startswith'")
+
+        service = Service.__new__(Service)
+        service.authenticated = False
+        service.yt = FakeYtMusic()
+        service.fallback_explore = lambda: [{"title": "fallback"}]
+
+        self.assertEqual(service.dispatch("explore", {}), [{"title": "fallback"}])
+
+    def test_browse_rejects_missing_id_before_calling_ytmusicapi(self) -> None:
+        service = Service.__new__(Service)
+        service.yt = object()
+
+        with self.assertRaisesRegex(ValueError, "플레이리스트의 ID"):
+            service.dispatch("browse", {"kind": "playlist"})
+
+
 class SavedAuthenticationTests(unittest.TestCase):
     def test_quick_login_reuses_the_normal_authentication_validation(self) -> None:
         service = Service.__new__(Service)

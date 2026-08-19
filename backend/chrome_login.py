@@ -12,20 +12,18 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import websocket
 
 
 MUSIC_LIBRARY_URL = "https://music.youtube.com/library"
-BROWSE_PATH = "/youtubei/v1/browse"
-REQUIRED_HEADERS = {"authorization", "cookie", "x-goog-authuser"}
+MUSIC_ORIGIN = "https://music.youtube.com"
 START_TIMEOUT_SECONDS = 15
 LOGIN_TIMEOUT_SECONDS = 5 * 60
-CAPTURE_TIMEOUT_SECONDS = 30
-MAX_PENDING_REQUESTS = 128
+CAPTURE_TIMEOUT_SECONDS = 10
 LOGIN_COOKIE = "__Secure-3PAPISID"
 
 
@@ -33,75 +31,41 @@ class ChromeLoginError(RuntimeError):
     pass
 
 
-def is_music_browse_request(url: str, method: str) -> bool:
-    parsed = urlsplit(url)
-    return (
-        method.upper() == "POST"
-        and parsed.scheme == "https"
-        and parsed.hostname == "music.youtube.com"
-        and parsed.path == BROWSE_PATH
+def auth_headers_from_cookies(cookies: Any, timestamp: int | None = None) -> str:
+    """Build the browser-auth headers ytmusicapi needs from CDP cookie data."""
+    if not isinstance(cookies, list):
+        raise ChromeLoginError("Chrome에서 YouTube Music 쿠키를 읽지 못했습니다.")
+
+    values: list[tuple[str, str]] = []
+    sapisid = ""
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name") or "")
+        value = str(cookie.get("value") or "")
+        if not name or any(character in name + value for character in "\r\n;"):
+            continue
+        values.append((name, value))
+        if name == LOGIN_COOKIE:
+            sapisid = value
+
+    if not sapisid:
+        raise ChromeLoginError(
+            "YouTube Music 로그인 쿠키가 없습니다. Chrome에서 로그인을 완료한 뒤 다시 시도해 주세요."
+        )
+
+    now = int(time.time()) if timestamp is None else timestamp
+    digest = sha1(f"{now} {sapisid} {MUSIC_ORIGIN}".encode()).hexdigest()
+    cookie_header = "; ".join(f"{name}={value}" for name, value in values)
+    return "\n".join(
+        (
+            f"authorization: SAPISIDHASH {now}_{digest}",
+            f"cookie: {cookie_header}",
+            "x-goog-authuser: 0",
+            f"origin: {MUSIC_ORIGIN}",
+            f"x-origin: {MUSIC_ORIGIN}",
+        )
     )
-
-
-def headers_as_text(headers: dict[str, Any]) -> str | None:
-    normalized = {
-        str(name).lower(): str(value)
-        for name, value in headers.items()
-        if not str(name).startswith(":") and value is not None
-    }
-    if not REQUIRED_HEADERS.issubset(normalized):
-        return None
-    return "\n".join(f"{name}: {value}" for name, value in normalized.items())
-
-
-class BrowseRequestCollector:
-    """Correlate CDP request and extra-info events without retaining other traffic."""
-
-    def __init__(self) -> None:
-        self._browse_requests: set[str] = set()
-        self._headers: dict[str, dict[str, Any]] = {}
-
-    def ingest(self, event: dict[str, Any]) -> str | None:
-        method = event.get("method")
-        params = event.get("params")
-        if not isinstance(params, dict):
-            return None
-        request_id = str(params.get("requestId") or "")
-        if not request_id:
-            return None
-
-        if method == "Network.requestWillBeSent":
-            request = params.get("request")
-            if not isinstance(request, dict) or not is_music_browse_request(
-                str(request.get("url") or ""), str(request.get("method") or "")
-            ):
-                self._headers.pop(request_id, None)
-                return None
-            self._browse_requests.add(request_id)
-            self._merge(request_id, request.get("headers"))
-        elif method == "Network.requestWillBeSentExtraInfo":
-            self._merge(request_id, params.get("headers"))
-        else:
-            return None
-
-        if request_id not in self._browse_requests:
-            return None
-        return headers_as_text(self._headers.get(request_id, {}))
-
-    def _merge(self, request_id: str, raw_headers: Any) -> None:
-        if not isinstance(raw_headers, dict):
-            return
-        if request_id not in self._headers and len(self._headers) >= MAX_PENDING_REQUESTS:
-            oldest = next(
-                (
-                    pending
-                    for pending in self._headers
-                    if pending not in self._browse_requests
-                ),
-                next(iter(self._headers)),
-            )
-            self._headers.pop(oldest, None)
-        self._headers.setdefault(request_id, {}).update(raw_headers)
 
 
 def find_chromium_browser() -> str:
@@ -296,12 +260,11 @@ def _capture_from_authenticated_profile(
             json.dumps(
                 {
                     "id": 2,
-                    "method": "Page.navigate",
-                    "params": {"url": MUSIC_LIBRARY_URL},
+                    "method": "Network.getCookies",
+                    "params": {"urls": [MUSIC_LIBRARY_URL]},
                 }
             )
         )
-        collector = BrowseRequestCollector()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -314,11 +277,14 @@ def _capture_from_authenticated_profile(
                 raise ChromeLoginError("로그인 확인용 브라우저 연결이 끊겼습니다.") from exc
             except (json.JSONDecodeError, TypeError):
                 continue
-            if headers := collector.ingest(event):
-                return headers
-        raise ChromeLoginError(
-            "YouTube Music 로그인 정보를 확인하지 못했습니다. 다시 시도해 주세요."
-        )
+            if event.get("id") != 2:
+                continue
+            if event.get("error"):
+                raise ChromeLoginError("Chrome에서 로그인 쿠키를 읽지 못했습니다.")
+            result = event.get("result")
+            cookies = result.get("cookies") if isinstance(result, dict) else None
+            return auth_headers_from_cookies(cookies)
+        raise ChromeLoginError("Chrome 로그인 쿠키 확인 시간이 초과되었습니다.")
     finally:
         if connection is not None:
             try:

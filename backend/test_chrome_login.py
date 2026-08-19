@@ -1,45 +1,40 @@
 import sqlite3
 import tempfile
 import unittest
+from hashlib import sha1
 from pathlib import Path
 
 from chrome_login import (
-    BrowseRequestCollector,
+    ChromeLoginError,
+    auth_headers_from_cookies,
     capture_command,
     has_youtube_login_cookie,
-    headers_as_text,
     interactive_login_command,
-    is_music_browse_request,
 )
 
 
 class ChromeLoginTests(unittest.TestCase):
-    def test_only_music_browse_post_requests_are_accepted(self) -> None:
-        self.assertTrue(
-            is_music_browse_request(
-                "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false",
-                "POST",
-            )
+    def test_auth_headers_are_built_from_cdp_cookies(self) -> None:
+        timestamp = 1_700_000_000
+        sapisid = "secret-value"
+        captured = auth_headers_from_cookies(
+            [
+                {"name": "PREF", "value": "hl=ko"},
+                {"name": "__Secure-3PAPISID", "value": sapisid},
+            ],
+            timestamp,
         )
-        self.assertFalse(
-            is_music_browse_request(
-                "https://music.youtube.com/youtubei/v1/search", "POST"
-            )
-        )
+        digest = sha1(
+            f"{timestamp} {sapisid} https://music.youtube.com".encode()
+        ).hexdigest()
 
-    def test_headers_require_authenticated_browser_values(self) -> None:
-        self.assertIsNone(headers_as_text({"Cookie": "SID=one"}))
-        captured = headers_as_text(
-            {
-                "Authorization": "SAPISIDHASH value",
-                "Cookie": "SID=one",
-                "X-Goog-AuthUser": "0",
-            }
-        )
-
-        self.assertIn("authorization: SAPISIDHASH value", captured)
-        self.assertIn("cookie: SID=one", captured)
+        self.assertIn(f"authorization: SAPISIDHASH {timestamp}_{digest}", captured)
+        self.assertIn("cookie: PREF=hl=ko; __Secure-3PAPISID=secret-value", captured)
         self.assertIn("x-goog-authuser: 0", captured)
+
+    def test_auth_headers_require_login_cookie(self) -> None:
+        with self.assertRaises(ChromeLoginError):
+            auth_headers_from_cookies([{"name": "PREF", "value": "hl=ko"}])
 
     def test_interactive_login_has_no_automation_flags(self) -> None:
         command = interactive_login_command("/browser", Path("/profile"))
@@ -70,68 +65,6 @@ class ChromeLoginTests(unittest.TestCase):
             connection.close()
 
             self.assertTrue(has_youtube_login_cookie(profile))
-
-    def test_collector_correlates_extra_headers_arriving_first(self) -> None:
-        collector = BrowseRequestCollector()
-        self.assertIsNone(
-            collector.ingest(
-                {
-                    "method": "Network.requestWillBeSentExtraInfo",
-                    "params": {
-                        "requestId": "request-1",
-                        "headers": {
-                            "Cookie": "SID=one",
-                            "Authorization": "SAPISIDHASH value",
-                        },
-                    },
-                }
-            )
-        )
-
-        captured = collector.ingest(
-            {
-                "method": "Network.requestWillBeSent",
-                "params": {
-                    "requestId": "request-1",
-                    "request": {
-                        "url": "https://music.youtube.com/youtubei/v1/browse",
-                        "method": "POST",
-                        "headers": {"X-Goog-AuthUser": "0"},
-                    },
-                },
-            }
-        )
-
-        self.assertIn("authorization: SAPISIDHASH value", captured)
-        self.assertIn("cookie: SID=one", captured)
-
-    def test_collector_discards_headers_for_other_requests(self) -> None:
-        collector = BrowseRequestCollector()
-        collector.ingest(
-            {
-                "method": "Network.requestWillBeSentExtraInfo",
-                "params": {
-                    "requestId": "other-request",
-                    "headers": {"Cookie": "temporary"},
-                },
-            }
-        )
-        collector.ingest(
-            {
-                "method": "Network.requestWillBeSent",
-                "params": {
-                    "requestId": "other-request",
-                    "request": {
-                        "url": "https://accounts.google.com/login",
-                        "method": "POST",
-                        "headers": {},
-                    },
-                },
-            }
-        )
-
-        self.assertNotIn("other-request", collector._headers)
-
 
 if __name__ == "__main__":
     unittest.main()

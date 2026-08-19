@@ -442,10 +442,21 @@ class Service:
         if op == "logout":
             return self.logout()
         if op == "home":
-            sections = normalize_sections(self.yt.get_home(limit=int(params.get("limit", 8))))
+            try:
+                raw = self.yt.get_home(limit=int(params.get("limit", 8)))
+            except Exception:
+                if self.authenticated:
+                    raise
+                return self.fallback_home()
+            sections = normalize_sections(raw)
             return sections or self.fallback_home()
         if op == "explore":
-            raw = self.yt.get_explore()
+            try:
+                raw = self.yt.get_explore()
+            except Exception:
+                if self.authenticated:
+                    raise
+                return self.fallback_explore()
             sections: list[dict[str, Any]] = []
             for key, title in (
                 ("new_releases", "새 앨범 및 싱글"),
@@ -479,8 +490,11 @@ class Service:
                 sections.append({"title": "아티스트", "subtitle": "", "items": normalize_items(self.yt.get_library_artists(limit=limit), "artist")})
             return [section for section in sections if section["items"]]
         if op == "watch":
+            video_id = text(params.get("videoId"))
+            if not video_id:
+                raise ValueError("재생할 영상의 ID가 없습니다.")
             raw = self.yt.get_watch_playlist(
-                videoId=params["videoId"], limit=int(params.get("limit", 50))
+                videoId=video_id, limit=int(params.get("limit", 50))
             )
             return {
                 "playlistId": raw.get("playlistId"),
@@ -499,14 +513,21 @@ class Service:
             }
         if op == "browse":
             kind = text(params.get("kind")).lower()
-            browse_id = params.get("browseId")
-            playlist_id = params.get("playlistId")
+            browse_id = text(params.get("browseId"))
+            playlist_id = text(params.get("playlistId"))
             if kind == "artist":
+                if not browse_id:
+                    raise ValueError("아티스트의 ID가 없습니다.")
                 raw = self.yt.get_artist(browse_id)
             elif kind in ("album", "single"):
+                if not browse_id:
+                    raise ValueError("앨범의 ID가 없습니다.")
                 raw = self.yt.get_album(browse_id)
             else:
-                raw = self.yt.get_playlist(playlist_id or browse_id, limit=100)
+                identifier = playlist_id or browse_id
+                if not identifier:
+                    raise ValueError("플레이리스트의 ID가 없습니다.")
+                raw = self.yt.get_playlist(identifier, limit=100)
             return detail_page(raw, kind)
         if op == "lyrics":
             raw = self.yt.get_lyrics(params["browseId"], timestamps=False) or {}

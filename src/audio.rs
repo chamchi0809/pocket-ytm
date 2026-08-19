@@ -1008,6 +1008,11 @@ fn stream_http_ranges(
                 .context("오디오 응답을 FFmpeg에 전달하지 못했습니다");
         }
         if response.status() != StatusCode::PARTIAL_CONTENT {
+            if response.status() == StatusCode::FORBIDDEN {
+                anyhow::bail!(
+                    "YouTube가 비로그인 재생을 제한했습니다. YouTube Music Premium 계정으로 로그인한 뒤 다시 시도해 주세요"
+                );
+            }
             anyhow::bail!(
                 "오디오 서버가 Range 요청을 거부했습니다: {}",
                 response.status()
