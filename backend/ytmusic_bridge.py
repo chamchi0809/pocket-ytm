@@ -133,6 +133,16 @@ def thumbnail(raw: Any) -> str | None:
     return (suitable[0] if suitable else candidates[-1])["url"]
 
 
+def item_thumbnail(raw: Any, video_id: str | None) -> str | None:
+    resolved = thumbnail(raw)
+    if resolved or not video_id or not re.fullmatch(r"[A-Za-z0-9_-]+", video_id):
+        return resolved
+    # Playlist/watch responses often omit the thumbnail array for tracks even
+    # though their video id is present. The stable YouTube thumbnail endpoint
+    # avoids rendering a list of anonymous music-note placeholders.
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
 def names(values: Any) -> list[str]:
     if not isinstance(values, list):
         return []
@@ -215,7 +225,7 @@ def normalize_item(raw: Any, fallback_kind: str = "unknown") -> dict[str, Any] |
         "videoId": video_id,
         "browseId": browse_id,
         "playlistId": playlist_id,
-        "thumbnail": thumbnail(raw),
+        "thumbnail": item_thumbnail(raw, video_id),
         "durationSeconds": parse_duration(
             raw.get("duration_seconds") or raw.get("duration") or raw.get("length")
         ),
@@ -291,23 +301,48 @@ class Service:
                 "ytmusicapi가 설치되지 않았습니다. `./scripts/bootstrap.sh`를 먼저 실행하세요."
             ) from exc
         self.auth_path = Path(args.auth).expanduser() if args.auth else None
+        self.account_path = (
+            self.auth_path.with_name("account.json") if self.auth_path else None
+        )
         self.language = args.language
         self.location = args.location
         auth = str(self.auth_path) if self.auth_path and self.auth_path.is_file() else None
         self.authenticated = bool(auth)
-        self.yt = YTMusic(auth=auth, language=self.language, location=self.location)
-        self.account: dict[str, Any] = {}
+        try:
+            self.yt = YTMusic(auth=auth, language=self.language, location=self.location)
+        except Exception:
+            self.authenticated = False
+            self.yt = YTMusic(language=self.language, location=self.location)
+        self.account = self.read_account_cache() if self.authenticated else {}
+
+    def read_account_cache(self) -> dict[str, Any]:
+        if self.account_path is None or not self.account_path.is_file():
+            return {}
+        try:
+            raw = json.loads(self.account_path.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def write_account_cache(self) -> None:
+        if self.account_path is None or not self.account:
+            return
+        cached = {
+            key: self.account[key]
+            for key in ("accountName", "name", "channelHandle", "handle", "accountPhotoUrl", "thumbnail")
+            if self.account.get(key)
+        }
+        if not cached:
+            return
+        self.account_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.account_path.with_suffix(self.account_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(cached, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, self.account_path)
+        if os.name != "nt":
+            os.chmod(self.account_path, 0o600)
 
     def account_status(self) -> dict[str, Any]:
-        if self.authenticated and not self.account:
-            try:
-                raw = self.yt.get_account_info()
-                self.account = raw if isinstance(raw, dict) else {}
-            except Exception:
-                # The account-menu endpoint occasionally returns an empty response even
-                # while authenticated library endpoints continue to work.
-                self.account = {}
-        raw = self.account
+        raw = self.account if self.authenticated else {}
         return {
             "authenticated": self.authenticated,
             "name": text(raw.get("accountName") or raw.get("name")),
@@ -357,6 +392,9 @@ class Service:
         self.yt = authenticated
         self.authenticated = True
         self.account = account if isinstance(account, dict) else {}
+        if self.account_path is not None:
+            self.account_path.unlink(missing_ok=True)
+        self.write_account_cache()
         return self.account_status()
 
     def logout(self) -> dict[str, Any]:
@@ -365,6 +403,8 @@ class Service:
         if self.auth_path is not None:
             self.auth_path.unlink(missing_ok=True)
             self.auth_path.with_name("cookies.txt").unlink(missing_ok=True)
+        if self.account_path is not None:
+            self.account_path.unlink(missing_ok=True)
         self.yt = YTMusic(language=self.language, location=self.location)
         self.authenticated = False
         self.account = {}

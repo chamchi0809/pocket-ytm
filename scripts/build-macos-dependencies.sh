@@ -7,7 +7,6 @@ python_bin=${POCKET_YTM_BUILD_PYTHON:-"$project_dir/.venv/bin/python"}
 jobs=${POCKET_YTM_BUILD_JOBS:-3}
 
 yt_dlp_version=2026.07.04
-yt_dlp_sha256=b0724470a0cf6dae5175a87eee05d6e75c5a0c10d2c3015166bd4d34e92b1b7b
 deno_version=2.9.5
 deno_sha256=b796aadd131f6930560c1ee040cf0d6f53933fbb987464e9ff46bd7ea4830615
 ffmpeg_version=9.0.1
@@ -29,7 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-install -d "$output_dir/bin" "$output_dir/licenses"
+install -d "$output_dir/bin" "$output_dir/libexec" "$output_dir/licenses"
 
 "$python_bin" -m pip install --disable-pip-version-check -r "$project_dir/requirements-build-macos.txt"
 
@@ -49,26 +48,10 @@ verify_sha256() {
     fi
 }
 
-thin_to_arm64() {
-    file=$1
-    architectures=$(lipo -archs "$file" 2>/dev/null || true)
-    case "$architectures" in
-        *arm64*x86_64* | *x86_64*arm64*)
-            lipo "$file" -thin arm64 -output "$file.arm64"
-            chmod "$(stat -f '%Lp' "$file")" "$file.arm64"
-            mv "$file.arm64" "$file"
-            ;;
-        *x86_64*)
-            echo "yt-dlp runtime contains an Intel-only binary: $file" >&2
-            exit 1
-            ;;
-    esac
-}
-
 "$python_bin" -m PyInstaller \
     --noconfirm \
     --clean \
-    --onefile \
+    --onedir \
     --target-architecture arm64 \
     --collect-all ytmusicapi \
     --name pocket-ytm-bridge \
@@ -76,21 +59,30 @@ thin_to_arm64() {
     --workpath "$work_dir/bridge-work" \
     --specpath "$work_dir/bridge-spec" \
     "$project_dir/backend/ytmusic_bridge.py"
-install -m 755 "$work_dir/bridge-dist/pocket-ytm-bridge" "$output_dir/bin/pocket-ytm-bridge"
+rm -rf "$output_dir/libexec/pocket-ytm-bridge"
+ditto \
+    "$work_dir/bridge-dist/pocket-ytm-bridge" \
+    "$output_dir/libexec/pocket-ytm-bridge"
+chmod 755 "$output_dir/libexec/pocket-ytm-bridge/pocket-ytm-bridge"
 
-yt_dlp_download="$work_dir/yt-dlp_macos.zip"
-download \
-    "https://github.com/yt-dlp/yt-dlp/releases/download/$yt_dlp_version/yt-dlp_macos.zip" \
-    "$yt_dlp_download"
-verify_sha256 "$yt_dlp_sha256" "$yt_dlp_download"
-ditto -x -k "$yt_dlp_download" "$work_dir/yt-dlp-runtime"
-mv "$work_dir/yt-dlp-runtime/yt-dlp_macos" "$work_dir/yt-dlp-runtime/yt-dlp"
-find "$work_dir/yt-dlp-runtime" -type f -print | while IFS= read -r file; do
-    thin_to_arm64 "$file"
-done
-rm -rf "$output_dir/bin/yt-dlp-runtime"
-ditto "$work_dir/yt-dlp-runtime" "$output_dir/bin/yt-dlp-runtime"
-chmod 755 "$output_dir/bin/yt-dlp-runtime/yt-dlp"
+"$python_bin" -m PyInstaller \
+    --noconfirm \
+    --clean \
+    --onedir \
+    --target-architecture arm64 \
+    --collect-all yt_dlp \
+    --collect-all yt_dlp_ejs \
+    --copy-metadata yt-dlp \
+    --name pocket-ytm-resolver \
+    --distpath "$work_dir/resolver-dist" \
+    --workpath "$work_dir/resolver-work" \
+    --specpath "$work_dir/resolver-spec" \
+    "$project_dir/backend/yt_dlp_resolver.py"
+rm -rf "$output_dir/libexec/pocket-ytm-resolver"
+ditto \
+    "$work_dir/resolver-dist/pocket-ytm-resolver" \
+    "$output_dir/libexec/pocket-ytm-resolver"
+chmod 755 "$output_dir/libexec/pocket-ytm-resolver/pocket-ytm-resolver"
 
 deno_archive="$work_dir/deno.zip"
 download \
@@ -142,23 +134,19 @@ download \
     "https://raw.githubusercontent.com/sigma67/ytmusicapi/1.12.2/LICENSE" \
     "$output_dir/licenses/ytmusicapi-LICENSE.txt"
 
-for binary in pocket-ytm-bridge deno ffmpeg ffprobe; do
-    lipo "$output_dir/bin/$binary" -verify_arch arm64
-    if otool -L "$output_dir/bin/$binary" | tail -n +2 | grep -E '/opt/homebrew|/usr/local|/Users/' >/dev/null; then
+for binary in \
+    "$output_dir/libexec/pocket-ytm-bridge/pocket-ytm-bridge" \
+    "$output_dir/libexec/pocket-ytm-resolver/pocket-ytm-resolver" \
+    "$output_dir/bin/deno" \
+    "$output_dir/bin/ffmpeg" \
+    "$output_dir/bin/ffprobe"
+do
+    lipo "$binary" -verify_arch arm64
+    if otool -L "$binary" | tail -n +2 | grep -E '/opt/homebrew|/usr/local|/Users/' >/dev/null; then
         echo "$binary links a non-system dependency" >&2
-        otool -L "$output_dir/bin/$binary" >&2
+        otool -L "$binary" >&2
         exit 1
     fi
-done
-lipo "$output_dir/bin/yt-dlp-runtime/yt-dlp" -verify_arch arm64
-find "$output_dir/bin/yt-dlp-runtime" -type f -print | while IFS= read -r file; do
-    architectures=$(lipo -archs "$file" 2>/dev/null || true)
-    case " $architectures " in
-        *"x86_64"*)
-            echo "yt-dlp runtime still contains an Intel slice: $file" >&2
-            exit 1
-            ;;
-    esac
 done
 
 {

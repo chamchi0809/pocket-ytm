@@ -1,6 +1,12 @@
 import unittest
 
-from ytmusic_bridge import Service, normalize_auth_input, normalize_item, thumbnail
+from ytmusic_bridge import (
+    Service,
+    item_thumbnail,
+    normalize_auth_input,
+    normalize_item,
+    thumbnail,
+)
 
 
 class NormalizeAuthInputTests(unittest.TestCase):
@@ -68,6 +74,13 @@ class NormalizeMediaItemTests(unittest.TestCase):
 
         self.assertEqual(item["durationSeconds"], 209)
 
+    def test_track_thumbnail_falls_back_to_the_video_endpoint(self) -> None:
+        self.assertEqual(
+            item_thumbnail({"videoId": "abc_123-Z"}, "abc_123-Z"),
+            "https://i.ytimg.com/vi/abc_123-Z/hqdefault.jpg",
+        )
+        self.assertIsNone(item_thumbnail({}, "not/a/video/id"))
+
 
 class LibraryOrderingTests(unittest.TestCase):
     def test_playlists_are_the_first_library_section(self) -> None:
@@ -95,6 +108,35 @@ class LibraryOrderingTests(unittest.TestCase):
         sections = service.dispatch("library", {"category": "all", "limit": 10})
 
         self.assertEqual(sections[0]["title"], "플레이리스트")
+
+
+class SavedAuthenticationTests(unittest.TestCase):
+    def test_cached_account_status_does_not_make_a_network_request(self) -> None:
+        class FakeYtMusic:
+            def __getattr__(self, _name):
+                raise AssertionError("account status must use only cached metadata")
+
+        service = Service.__new__(Service)
+        service.authenticated = True
+        service.account = {"accountName": "저장된 계정"}
+        service.account_path = None
+        service.yt = FakeYtMusic()
+
+        status = service.account_status()
+
+        self.assertTrue(status["authenticated"])
+        self.assertEqual(status["name"], "저장된 계정")
+
+    def test_saved_auth_is_optimistically_restored_until_an_api_request_fails(self) -> None:
+        service = Service.__new__(Service)
+        service.authenticated = True
+        service.account = {"accountName": "오래된 계정"}
+        service.account_path = None
+
+        status = service.account_status()
+
+        self.assertTrue(status["authenticated"])
+        self.assertEqual(status["name"], "오래된 계정")
 
 
 if __name__ == "__main__":

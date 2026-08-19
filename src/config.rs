@@ -5,7 +5,7 @@ pub struct AppConfig {
     pub python: String,
     pub auth_path: PathBuf,
     pub settings_path: PathBuf,
-    pub yt_dlp: String,
+    pub media_resolver: PathBuf,
     pub ffmpeg: String,
     pub deno: Option<String>,
     pub cookies_path: Option<PathBuf>,
@@ -46,7 +46,9 @@ impl AppConfig {
             python,
             auth_path,
             settings_path,
-            yt_dlp: tool_from_env_or_bundle("POCKET_YTM_YTDLP", "yt-dlp-runtime/yt-dlp", "yt-dlp"),
+            media_resolver: path_env("POCKET_YTM_RESOLVER")
+                .or_else(|| bundled_tool_path("pocket-ytm-resolver"))
+                .unwrap_or_else(|| manifest.join("backend/yt_dlp_resolver.py")),
             ffmpeg: tool_from_env_or_bundle("POCKET_YTM_FFMPEG", "ffmpeg", "ffmpeg"),
             deno: std::env::var("POCKET_YTM_DENO")
                 .ok()
@@ -80,12 +82,20 @@ fn bundled_tool_path_for_executable(executable: &std::path::Path, name: &str) ->
     if macos.file_name()? != "MacOS" || contents.file_name()? != "Contents" {
         return None;
     }
-    Some(contents.join("Resources/bin").join(name))
+    let resources = contents.join("Resources");
+    if matches!(name, "pocket-ytm-bridge" | "pocket-ytm-resolver") {
+        Some(resources.join("libexec").join(name).join(name))
+    } else {
+        Some(resources.join("bin").join(name))
+    }
 }
 
 fn default_auth_path(manifest: &std::path::Path) -> PathBuf {
     let project_auth = manifest.join("auth.json");
-    if project_auth.exists() {
+    let is_packaged_app = std::env::current_exe()
+        .ok()
+        .is_some_and(|executable| is_app_bundle_executable(&executable));
+    if !is_packaged_app && project_auth.exists() {
         return project_auth;
     }
 
@@ -112,6 +122,16 @@ fn default_auth_path(manifest: &std::path::Path) -> PathBuf {
     project_auth
 }
 
+fn is_app_bundle_executable(executable: &std::path::Path) -> bool {
+    executable
+        .parent()
+        .zip(executable.parent().and_then(std::path::Path::parent))
+        .is_some_and(|(macos, contents)| {
+            macos.file_name().is_some_and(|name| name == "MacOS")
+                && contents.file_name().is_some_and(|name| name == "Contents")
+        })
+}
+
 fn path_env(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
@@ -132,6 +152,12 @@ mod tests {
                 "/Applications/Pocket Music.app/Contents/Resources/bin/ffmpeg"
             ))
         );
+        assert_eq!(
+            bundled_tool_path_for_executable(&executable, "pocket-ytm-bridge"),
+            Some(PathBuf::from(
+                "/Applications/Pocket Music.app/Contents/Resources/libexec/pocket-ytm-bridge/pocket-ytm-bridge"
+            ))
+        );
     }
 
     #[test]
@@ -142,5 +168,15 @@ mod tests {
             bundled_tool_path_for_executable(&executable, "ffmpeg"),
             None
         );
+    }
+
+    #[test]
+    fn packaged_executables_are_detected_without_reading_the_source_tree() {
+        assert!(is_app_bundle_executable(std::path::Path::new(
+            "/Applications/Pocket Music.app/Contents/MacOS/pocket-ytm"
+        )));
+        assert!(!is_app_bundle_executable(std::path::Path::new(
+            "/project/target/release/pocket-ytm"
+        )));
     }
 }

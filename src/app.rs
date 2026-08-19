@@ -2,10 +2,14 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use gpui::{
     AnyElement, Context, Entity, Focusable as _, IntoElement, MouseButton, MouseMoveEvent,
-    ObjectFit, Render, SharedString, StyledImage as _, Task, Timer, Window, div, img, prelude::*,
-    px, relative, rgb,
+    ObjectFit, Render, SharedString, StyledImage as _, Task, Timer, Window, div, image_cache, img,
+    prelude::*, px, relative, retain_all, rgb, rgba,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{
+    Sizable as _,
+    input::{Input, InputEvent, InputState},
+    spinner::Spinner,
+};
 
 use crate::{
     CheckForUpdates, FocusSearch, NextTrack, PreviousTrack, TogglePlayback,
@@ -41,12 +45,24 @@ enum UpdateState {
     Error(String),
 }
 
+fn loading_indicator(label: impl Into<SharedString>) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .child(Spinner::new().small())
+        .child(label.into())
+        .into_any_element()
+}
+
 pub struct PocketYtmApp {
     backend: Arc<YtMusicBridge>,
     audio: AudioEngine,
     search_input: Entity<InputState>,
     auth_input: Entity<InputState>,
     auth_status: AccountStatus,
+    auth_loading: bool,
     show_auth: bool,
     auth_busy: bool,
     auth_message: Option<String>,
@@ -56,8 +72,10 @@ pub struct PocketYtmApp {
     search_query: String,
     detail: Option<BrowsePage>,
     loading: bool,
+    content_image_generation: u64,
     error: Option<String>,
     sidebar_playlists: Vec<MediaItem>,
+    sidebar_playlists_loading: bool,
     queue: Vec<MediaItem>,
     queue_index: usize,
     show_queue: bool,
@@ -127,6 +145,7 @@ impl PocketYtmApp {
             search_input,
             auth_input,
             auth_status: AccountStatus::default(),
+            auth_loading: true,
             show_auth: std::env::var_os("POCKET_YTM_SHOW_LOGIN").is_some(),
             auth_busy: false,
             auth_message: None,
@@ -136,8 +155,10 @@ impl PocketYtmApp {
             search_query: String::new(),
             detail: None,
             loading: false,
+            content_image_generation: 0,
             error: None,
             sidebar_playlists: vec![],
+            sidebar_playlists_loading: false,
             queue: vec![],
             queue_index: 0,
             show_queue: false,
@@ -283,28 +304,23 @@ impl PocketYtmApp {
     }
 
     fn load_auth_status(&mut self, cx: &mut Context<Self>) {
-        let backend = self.backend.clone();
-        let task = cx.background_spawn(async move { backend.auth_status() });
-        cx.spawn(async move |weak, cx| {
-            let result = task.await;
-            if let Some(entity) = weak.upgrade() {
-                entity
-                    .update(cx, |this, cx| {
-                        if let Ok(status) = result {
-                            let authenticated = status.authenticated;
-                            this.auth_status = status;
-                            if authenticated {
-                                this.load_sidebar_playlists(cx);
-                            } else {
-                                this.sidebar_playlists.clear();
-                            }
-                            cx.notify();
-                        }
-                    })
-                    .ok();
+        let status = self.backend.cached_auth_status();
+        let authenticated = status.authenticated;
+        self.auth_status = status;
+        self.auth_loading = false;
+        if authenticated {
+            if self.page == Page::Library {
+                self.load_library(cx);
             }
-        })
-        .detach();
+        } else {
+            self.sidebar_playlists.clear();
+            if self.page == Page::Library {
+                self.loading = false;
+                self.show_auth = true;
+                self.auth_message = Some("보관함을 사용하려면 먼저 로그인하세요.".into());
+            }
+        }
+        cx.notify();
     }
 
     fn authenticate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -323,7 +339,7 @@ impl PocketYtmApp {
         self.auth_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.auth_busy = true;
-        self.auth_message = Some("로그인 정보를 확인하고 있습니다…".into());
+        self.auth_message = Some("로그인 정보를 확인하고 있습니다".into());
         let backend = self.backend.clone();
         let task = cx.background_spawn(async move { backend.authenticate(&headers) });
         cx.spawn(async move |weak, cx| {
@@ -336,7 +352,6 @@ impl PocketYtmApp {
                             Ok(status) => {
                                 this.auth_status = status;
                                 this.auth_message = Some("로그인되었습니다.".into());
-                                this.load_sidebar_playlists(cx);
                                 this.load_home(cx);
                             }
                             Err(error) => {
@@ -357,7 +372,7 @@ impl PocketYtmApp {
             return;
         }
         self.auth_busy = true;
-        self.auth_message = Some("로그아웃하는 중…".into());
+        self.auth_message = Some("로그아웃하는 중".into());
         let backend = self.backend.clone();
         let task = cx.background_spawn(async move { backend.logout() });
         cx.spawn(async move |weak, cx| {
@@ -371,6 +386,7 @@ impl PocketYtmApp {
                                 this.auth_status = status;
                                 this.auth_message = Some("로그아웃되었습니다.".into());
                                 this.sidebar_playlists.clear();
+                                this.sidebar_playlists_loading = false;
                                 this.load_home(cx);
                             }
                             Err(error) => {
@@ -389,8 +405,13 @@ impl PocketYtmApp {
     fn load_sidebar_playlists(&mut self, cx: &mut Context<Self>) {
         if !self.auth_status.authenticated {
             self.sidebar_playlists.clear();
+            self.sidebar_playlists_loading = false;
             return;
         }
+        if self.sidebar_playlists_loading {
+            return;
+        }
+        self.sidebar_playlists_loading = true;
         let backend = self.backend.clone();
         let task = cx.background_spawn(async move { backend.library("playlists") });
         cx.spawn(async move |weak, cx| {
@@ -398,6 +419,12 @@ impl PocketYtmApp {
             if let Some(entity) = weak.upgrade() {
                 entity
                     .update(cx, |this, cx| {
+                        this.sidebar_playlists_loading = false;
+                        if !this.auth_status.authenticated {
+                            this.sidebar_playlists.clear();
+                            cx.notify();
+                            return;
+                        }
                         match result {
                             Ok(sections) => {
                                 this.sidebar_playlists = sections
@@ -443,7 +470,7 @@ impl PocketYtmApp {
     }
 
     fn on_toggle_playback(&mut self, _: &TogglePlayback, _: &mut Window, _: &mut Context<Self>) {
-        self.audio.toggle();
+        self.toggle_playback();
     }
 
     fn on_next_track(&mut self, _: &NextTrack, _: &mut Window, _: &mut Context<Self>) {
@@ -469,6 +496,18 @@ impl PocketYtmApp {
 
     fn next(&mut self) {
         self.play_next(false);
+    }
+
+    fn toggle_playback(&mut self) {
+        if matches!(
+            self.audio_snapshot.phase,
+            PlaybackPhase::Idle | PlaybackPhase::Ended | PlaybackPhase::Error
+        ) && !self.queue.is_empty()
+        {
+            self.start_queue_track(self.queue_index);
+        } else {
+            self.audio.toggle();
+        }
     }
 
     fn seek_to_fraction(&mut self, fraction: f64) {
@@ -542,6 +581,7 @@ impl PocketYtmApp {
 
     fn load_home(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Home;
+        self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.loading = true;
         self.error = None;
         let backend = self.backend.clone();
@@ -556,6 +596,9 @@ impl PocketYtmApp {
                             Ok(sections) => this.sections = sections,
                             Err(error) => this.error = Some(format!("{error:#}")),
                         }
+                        if this.auth_status.authenticated {
+                            this.load_sidebar_playlists(cx);
+                        }
                         cx.notify();
                     })
                     .ok();
@@ -567,6 +610,7 @@ impl PocketYtmApp {
 
     fn load_explore(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Explore;
+        self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.loading = true;
         self.error = None;
         let backend = self.backend.clone();
@@ -591,6 +635,13 @@ impl PocketYtmApp {
     }
 
     fn load_library(&mut self, cx: &mut Context<Self>) {
+        if self.auth_loading {
+            self.page = Page::Library;
+            self.loading = true;
+            self.error = None;
+            cx.notify();
+            return;
+        }
         if !self.auth_status.authenticated {
             self.show_auth = true;
             self.auth_message = Some("보관함을 사용하려면 먼저 로그인하세요.".into());
@@ -598,6 +649,7 @@ impl PocketYtmApp {
             return;
         }
         self.page = Page::Library;
+        self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.loading = true;
         self.error = None;
         let backend = self.backend.clone();
@@ -623,6 +675,7 @@ impl PocketYtmApp {
 
     fn search(&mut self, query: String, cx: &mut Context<Self>) {
         self.page = Page::Search;
+        self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.search_query = query.trim().to_owned();
         self.loading = true;
         self.error = None;
@@ -650,6 +703,7 @@ impl PocketYtmApp {
 
     fn browse(&mut self, item: MediaItem, cx: &mut Context<Self>) {
         self.page = Page::Detail;
+        self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.detail = None;
         self.loading = true;
         self.error = None;
@@ -674,22 +728,49 @@ impl PocketYtmApp {
         cx.notify();
     }
 
-    fn play_playlist(&mut self, playlist: MediaItem, cx: &mut Context<Self>) {
-        let Some(playlist_id) = playlist
-            .playlist_id
-            .clone()
-            .or_else(|| playlist.browse_id.clone())
-        else {
-            self.error = Some("이 플레이리스트의 ID를 찾지 못했습니다.".into());
-            cx.notify();
-            return;
-        };
-        self.page = Page::Detail;
-        self.detail = None;
+    fn play_collection(&mut self, collection: MediaItem, cx: &mut Context<Self>) {
         self.loading = true;
         self.error = None;
         let backend = self.backend.clone();
-        let task = cx.background_spawn(async move { backend.playlist_queue(&playlist_id) });
+        let collection_for_query = collection.clone();
+        let task = cx.background_spawn(async move {
+            if collection_for_query.kind == "playlist" {
+                let playlist_id = collection_for_query
+                    .playlist_id
+                    .clone()
+                    .or_else(|| collection_for_query.browse_id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("이 플레이리스트의 ID를 찾지 못했습니다."))?;
+                match backend.playlist_queue(&playlist_id) {
+                    Ok(watch) if !watch.items.is_empty() => Ok(watch.items),
+                    primary => backend
+                        .browse(&collection_for_query)
+                        .map(|detail| {
+                            detail
+                                .sections
+                                .into_iter()
+                                .flat_map(|section| section.items)
+                                .collect()
+                        })
+                        .map_err(|fallback| {
+                            anyhow::anyhow!(
+                                "플레이리스트 큐와 상세 목록을 모두 불러오지 못했습니다. 큐: {}; 상세: {fallback:#}",
+                                primary
+                                    .err()
+                                    .map(|error| format!("{error:#}"))
+                                    .unwrap_or_else(|| "빈 목록".into())
+                            )
+                        }),
+                }
+            } else {
+                backend.browse(&collection_for_query).map(|detail| {
+                    detail
+                        .sections
+                        .into_iter()
+                        .flat_map(|section| section.items)
+                        .collect()
+                })
+            }
+        });
         cx.spawn(async move |weak, cx| {
             let result = task.await;
             if let Some(entity) = weak.upgrade() {
@@ -697,23 +778,21 @@ impl PocketYtmApp {
                     .update(cx, |this, cx| {
                         this.loading = false;
                         match result {
-                            Ok(watch) => {
-                                let queue: Vec<_> = watch
-                                    .items
-                                    .into_iter()
-                                    .filter(MediaItem::playable)
-                                    .collect();
+                            Ok(items) => {
+                                let queue: Vec<_> =
+                                    items.into_iter().filter(MediaItem::playable).collect();
                                 let first = queue.first().cloned();
                                 if let Some(first) = first {
                                     this.play_item(first, queue, cx);
-                                    this.browse(playlist.clone(), cx);
                                 } else {
-                                    this.error = Some(
-                                        "이 플레이리스트에는 재생 가능한 곡이 없습니다.".into(),
-                                    );
+                                    this.error =
+                                        Some("이 모음에는 재생 가능한 곡이 없습니다.".into());
                                 }
                             }
-                            Err(error) => this.error = Some(format!("{error:#}")),
+                            Err(error) => {
+                                this.error =
+                                    Some(format!("재생 목록을 불러오지 못했습니다: {error:#}"));
+                            }
                         }
                         cx.notify();
                     })
@@ -826,6 +905,7 @@ impl PocketYtmApp {
         self.last_ended_generation = Some(self.audio_snapshot.generation);
         self.watch_queue_request = self.watch_queue_request.wrapping_add(1);
         self.audio.load(item);
+        self.audio_snapshot = self.audio.snapshot();
         self.lyrics = None;
         self.lyrics_browse_id = None;
         self.prefetch_queue_neighbors();
@@ -950,7 +1030,12 @@ impl PocketYtmApp {
                 })
                 .text_color(if active { rgb(0xffffff) } else { rgb(0xa7a7ad) })
                 .bg(if active { rgb(0x29292d) } else { rgb(0x171719) })
-                .hover(|style| style.bg(rgb(0x252529)).text_color(rgb(0xffffff)))
+                .hover(|style| {
+                    style
+                        .cursor_pointer()
+                        .bg(rgb(0x252529))
+                        .text_color(rgb(0xffffff))
+                })
                 .cursor_pointer()
                 .child(div().w(px(20.)).text_center().child(glyph))
                 .child(label)
@@ -969,7 +1054,8 @@ impl PocketYtmApp {
             .into_iter()
             .enumerate()
             .map(|(index, playlist)| {
-                let row_playlist = playlist.clone();
+                let play_playlist = playlist.clone();
+                let browse_playlist = playlist.clone();
                 div()
                     .id(SharedString::from(format!("sidebar-playlist-{index}")))
                     .group("sidebar-playlist")
@@ -981,9 +1067,9 @@ impl PocketYtmApp {
                     .py_2()
                     .rounded_lg()
                     .hover(|style| style.bg(rgb(0x252529)))
-                    .cursor_pointer()
                     .child(
                         div()
+                            .id(SharedString::from(format!("sidebar-play-{index}")))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -992,12 +1078,29 @@ impl PocketYtmApp {
                             .bg(rgb(0x29292d))
                             .text_size(px(10.))
                             .text_color(rgb(0xb9b9bf))
-                            .child("▶"),
+                            .hover(|style| {
+                                style
+                                    .cursor_pointer()
+                                    .bg(rgb(0xff3157))
+                                    .text_color(rgb(0xffffff))
+                            })
+                            .cursor_pointer()
+                            .child("▶")
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.play_collection(play_playlist.clone(), cx);
+                                }),
+                            ),
                     )
                     .child(
                         div()
+                            .id(SharedString::from(format!("sidebar-detail-{index}")))
                             .min_w_0()
                             .flex_1()
+                            .cursor_pointer()
+                            .hover(|style| style.cursor_pointer())
                             .child(
                                 div()
                                     .truncate()
@@ -1014,11 +1117,12 @@ impl PocketYtmApp {
                                         .text_color(rgb(0x77777e))
                                         .child(playlist.subtitle),
                                 )
-                            }),
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.browse(browse_playlist.clone(), cx);
+                            })),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.play_playlist(row_playlist.clone(), cx)
-                    }))
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -1065,43 +1169,62 @@ impl PocketYtmApp {
             .child(nav("홈", Page::Home, "⌂", cx))
             .child(nav("둘러보기", Page::Explore, "◉", cx))
             .child(nav("보관함", Page::Library, "▤", cx))
-            .when(self.auth_status.authenticated, |this| {
+            .when(self.auth_loading, |this| {
                 this.child(div().mt_4().mb_3().border_t_1().border_color(rgb(0x303034)))
                     .child(
                         div()
-                            .px_2()
-                            .mb_2()
-                            .text_size(px(11.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x85858c))
-                            .child("내 플레이리스트"),
-                    )
-                    .child(
-                        div()
-                            .id("sidebar-playlists-scroll")
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .children(playlist_rows),
+                            .text_size(px(11.))
+                            .text_color(rgb(0x85858c))
+                            .child(loading_indicator("계정 확인 중")),
                     )
             })
-            .when(!self.auth_status.authenticated, |this| {
-                this.child(div().flex_1())
-            })
+            .when(
+                !self.auth_loading && self.auth_status.authenticated,
+                |this| {
+                    this.child(div().mt_4().mb_3().border_t_1().border_color(rgb(0x303034)))
+                        .child(
+                            div()
+                                .px_2()
+                                .mb_2()
+                                .text_size(px(11.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(0x85858c))
+                                .child("내 플레이리스트"),
+                        )
+                        .child(
+                            div()
+                                .id("sidebar-playlists-scroll")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .children(playlist_rows),
+                        )
+                },
+            )
+            .when(
+                !self.auth_loading && !self.auth_status.authenticated,
+                |this| this.child(div().flex_1()),
+            )
             .child(
                 div()
                     .px_2()
                     .text_size(px(11.))
                     .line_height(px(17.))
                     .text_color(rgb(0x66666c))
-                    .child("GPUI · native audio")
-                    .child("Zero DOM · Zero Chromium"),
+                    .child("Pocket YT Music")
+                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
             )
             .into_any_element()
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let account_label = if self.auth_status.authenticated {
+        let account_label = if self.auth_loading {
+            "계정 확인 중".to_owned()
+        } else if self.auth_status.authenticated {
             if self.auth_status.name.is_empty() {
                 "내 계정".to_owned()
             } else {
@@ -1171,25 +1294,28 @@ impl PocketYtmApp {
                     .h(px(34.))
                     .rounded_full()
                     .border_1()
-                    .border_color(if self.auth_status.authenticated {
+                    .border_color(if self.auth_loading || self.auth_status.authenticated {
                         rgb(0x525258)
                     } else {
                         rgb(0xff3157)
                     })
                     .bg(rgb(0x252529))
-                    .hover(|style| style.bg(rgb(0x323237)))
+                    .hover(|style| style.cursor_pointer().bg(rgb(0x323237)))
                     .text_size(px(12.))
                     .text_color(rgb(0xf1f1f2))
                     .cursor_pointer()
-                    .child(
+                    .child(if self.auth_loading {
+                        Spinner::new().small().into_any_element()
+                    } else {
                         div()
                             .text_color(if self.auth_status.authenticated {
                                 rgb(0x56d887)
                             } else {
                                 rgb(0xff6c83)
                             })
-                            .child("●"),
-                    )
+                            .child("●")
+                            .into_any_element()
+                    })
                     .child(div().truncate().child(account_label))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_auth = true;
@@ -1211,9 +1337,14 @@ impl PocketYtmApp {
                 .object_fit(ObjectFit::Cover)
                 .with_loading(move || {
                     div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .size(px(size))
                         .rounded(px(rounded))
                         .bg(rgb(0x2b2b30))
+                        .text_color(rgb(0x77777e))
+                        .child(Spinner::new().with_size(px((size * 0.16).clamp(12., 24.))))
                         .into_any_element()
                 })
                 .with_fallback(move || {
@@ -1256,26 +1387,75 @@ impl PocketYtmApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let click_item = item.clone();
-        div()
+        let is_collection = matches!(item.kind.as_str(), "playlist" | "album" | "single");
+        let artwork = if is_collection {
+            let play_item = item.clone();
+            let hover_group =
+                SharedString::from(format!("collection-artwork-{}-{}", item.kind, item.id));
+            div()
+                .id(SharedString::from(format!(
+                    "collection-play-{}-{}",
+                    item.kind, item.id
+                )))
+                .group(hover_group.clone())
+                .relative()
+                .size(px(152.))
+                .rounded(px(8.))
+                .overflow_hidden()
+                .cursor_pointer()
+                .hover(|style| style.cursor_pointer())
+                .child(Self::artwork(&item, 152., 8.))
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "collection-play-overlay-{}-{}",
+                            item.kind, item.id
+                        )))
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .invisible()
+                        .group_hover(hover_group, |style| style.visible())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(rgba(0x00000066))
+                        .cursor_pointer()
+                        .hover(|style| style.cursor_pointer())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(46.))
+                                .rounded_full()
+                                .bg(rgb(0xff3157))
+                                .text_size(px(18.))
+                                .text_color(rgb(0xffffff))
+                                .child("▶"),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.play_collection(play_item.clone(), cx);
+                            }),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            Self::artwork(&item, 152., if item.kind == "artist" { 76. } else { 8. })
+        };
+        let details = div()
             .id(SharedString::from(format!(
-                "card-{}-{}",
+                "card-details-{}-{}",
                 item.kind, item.id
             )))
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .w(px(168.))
-            .max_w(px(168.))
-            .p_2()
-            .rounded_xl()
-            .overflow_hidden()
-            .hover(|style| style.bg(rgb(0x222226)))
+            .w_full()
             .cursor_pointer()
-            .child(Self::artwork(
-                &item,
-                152.,
-                if item.kind == "artist" { 76. } else { 8. },
-            ))
+            .hover(|style| style.cursor_pointer())
             .child(
                 div()
                     .mt_3()
@@ -1298,11 +1478,40 @@ impl PocketYtmApp {
                     } else {
                         item.subtitle.clone()
                     }),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.play_item(click_item.clone(), source_queue.clone(), cx)
-            }))
+            );
+        let card = div()
+            .id(SharedString::from(format!(
+                "card-{}-{}",
+                item.kind, item.id
+            )))
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w(px(168.))
+            .max_w(px(168.))
+            .p_2()
+            .rounded_xl()
+            .overflow_hidden()
+            .hover(|style| style.cursor_pointer().bg(rgb(0x222226)))
+            .child(artwork);
+        if is_collection {
+            card.child(details.on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.browse(click_item.clone(), cx);
+            })))
             .into_any_element()
+        } else {
+            card.cursor_pointer()
+                .child(details)
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.play_item(click_item.clone(), source_queue.clone(), cx);
+                    }),
+                )
+                .into_any_element()
+        }
     }
 
     fn render_row(
@@ -1321,7 +1530,7 @@ impl PocketYtmApp {
             .px_3()
             .gap_4()
             .rounded_lg()
-            .hover(|style| style.bg(rgb(0x222226)))
+            .hover(|style| style.cursor_pointer().bg(rgb(0x222226)))
             .cursor_pointer()
             .child(
                 div()
@@ -1378,9 +1587,13 @@ impl PocketYtmApp {
                     .text_color(rgb(0x8a8a91))
                     .child(duration),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.play_item(click_item.clone(), source_queue.clone(), cx)
-            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.play_item(click_item.clone(), source_queue.clone(), cx);
+                }),
+            )
             .into_any_element()
     }
 
@@ -1518,7 +1731,7 @@ impl PocketYtmApp {
                 .justify_center()
                 .h(px(320.))
                 .text_color(rgb(0x8a8a91))
-                .child("YouTube Music에서 불러오는 중…")
+                .child(loading_indicator("YouTube Music에서 불러오는 중"))
                 .into_any_element()
         } else if self.page == Page::Search {
             self.render_search_results(cx)
@@ -1603,7 +1816,7 @@ impl PocketYtmApp {
                         .p_2()
                         .rounded_lg()
                         .bg(if active { rgb(0x2a2023) } else { rgb(0x171719) })
-                        .hover(|style| style.bg(rgb(0x252529)))
+                        .hover(|style| style.cursor_pointer().bg(rgb(0x252529)))
                         .cursor_pointer()
                         .child(Self::artwork(&item, 42., 4.))
                         .child(
@@ -1630,15 +1843,18 @@ impl PocketYtmApp {
                                         .child(item.subtitle.clone()),
                                 ),
                         )
-                        .on_click(cx.listener(move |this, _, _, _| {
-                            if let Some(index) = this
-                                .queue
-                                .iter()
-                                .position(|candidate| candidate.id == queued_id)
-                            {
-                                this.start_queue_track(index);
-                            }
-                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, _| {
+                                if let Some(index) = this
+                                    .queue
+                                    .iter()
+                                    .position(|candidate| candidate.id == queued_id)
+                                {
+                                    this.start_queue_track(index);
+                                }
+                            }),
+                        )
                         .into_any_element(),
                 );
             }
@@ -1672,11 +1888,10 @@ impl PocketYtmApp {
                     .into_any_element(),
             )
         } else if self.show_lyrics {
-            let lyric_text = self
-                .lyrics
-                .as_ref()
-                .map(|lyrics| lyrics.text.clone())
-                .unwrap_or_else(|| "가사를 불러오는 중…".into());
+            let lyric_content = self.lyrics.as_ref().map_or_else(
+                || loading_indicator("가사를 불러오는 중"),
+                |lyrics| div().child(lyrics.text.clone()).into_any_element(),
+            );
             Some(
                 div()
                     .flex()
@@ -1706,7 +1921,7 @@ impl PocketYtmApp {
                             .text_size(px(17.))
                             .line_height(px(30.))
                             .text_color(rgb(0xd3d3d6))
-                            .child(lyric_text),
+                            .child(lyric_content),
                     )
                     .into_any_element(),
             )
@@ -1721,7 +1936,17 @@ impl PocketYtmApp {
         }
 
         let message = self.auth_message.clone();
-        let content = if self.auth_status.authenticated {
+        let content = if self.auth_loading {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(240.))
+                .text_size(px(13.))
+                .text_color(rgb(0xa8a8ae))
+                .child(loading_indicator("저장된 로그인 정보를 확인하는 중"))
+                .into_any_element()
+        } else if self.auth_status.authenticated {
             let avatar = if let Some(url) = self.auth_status.thumbnail.clone() {
                 div()
                     .size(px(72.))
@@ -1782,10 +2007,11 @@ impl PocketYtmApp {
                         .text_size(px(12.))
                         .text_color(rgb(0xff9cac))
                         .cursor_pointer()
+                        .hover(|style| style.cursor_pointer())
                         .child(if self.auth_busy {
-                            "처리 중…"
+                            loading_indicator("로그아웃하는 중")
                         } else {
-                            "로그아웃"
+                            div().child("로그아웃").into_any_element()
                         })
                         .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
                 )
@@ -1828,10 +2054,14 @@ impl PocketYtmApp {
                 ))
                 .child(step(
                     "2",
-                    "페이지를 새로고침하고 /browse POST 요청을 우클릭해 Copy → Copy as fetch (Node.js)를 누르세요.",
+                    "개발자 도구를 연 상태로 YouTube Music의 보관함으로 이동하세요. Network 탭에 /browse POST 요청이 생성됩니다.",
                 ))
                 .child(step(
                     "3",
+                    "/browse POST 요청을 우클릭해 Copy → Copy as fetch (Node.js)를 누르세요.",
+                ))
+                .child(step(
+                    "4",
                     "복사된 fetch 코드 전체를 아래에 붙여 넣으세요. JavaScript는 실행하지 않고 headers만 읽습니다.",
                 ))
                 .child(
@@ -1844,7 +2074,7 @@ impl PocketYtmApp {
                         .justify_center()
                         .rounded_lg()
                         .bg(rgb(0x2a2a2f))
-                        .hover(|style| style.bg(rgb(0x36363c)))
+                        .hover(|style| style.cursor_pointer().bg(rgb(0x36363c)))
                         .text_size(px(12.))
                         .text_color(rgb(0xe8e8eb))
                         .cursor_pointer()
@@ -1889,15 +2119,17 @@ impl PocketYtmApp {
                         } else {
                             rgb(0xff3157)
                         })
-                        .hover(|style| style.bg(rgb(0xff4d6d)))
+                        .hover(|style| style.cursor_pointer().bg(rgb(0xff4d6d)))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_size(px(13.))
                         .text_color(rgb(0xffffff))
                         .cursor_pointer()
                         .child(if self.auth_busy {
-                            "확인하는 중…"
+                            loading_indicator("확인하는 중")
                         } else {
-                            "붙여 넣은 fetch 코드로 로그인"
+                            div()
+                                .child("붙여 넣은 fetch 코드로 로그인")
+                                .into_any_element()
                         })
                         .on_click(
                             cx.listener(|this, _, window, cx| this.authenticate(window, cx)),
@@ -1942,7 +2174,9 @@ impl PocketYtmApp {
                                                 .text_size(px(22.))
                                                 .font_weight(gpui::FontWeight::BOLD)
                                                 .text_color(rgb(0xf7f7f8))
-                                                .child(if self.auth_status.authenticated {
+                                                .child(if self.auth_loading {
+                                                    "계정 확인 중"
+                                                } else if self.auth_status.authenticated {
                                                     "계정"
                                                 } else {
                                                     "YouTube Music 로그인"
@@ -1965,7 +2199,9 @@ impl PocketYtmApp {
                                         .size(px(34.))
                                         .rounded_full()
                                         .bg(rgb(0x2a2a2f))
-                                        .hover(|style| style.bg(rgb(0x39393f)))
+                                        .hover(|style| {
+                                            style.cursor_pointer().bg(rgb(0x39393f))
+                                        })
                                         .text_color(rgb(0xc8c8cc))
                                         .cursor_pointer()
                                         .child("×")
@@ -2006,7 +2242,9 @@ impl PocketYtmApp {
                 .text_center()
                 .text_size(px(14.))
                 .text_color(rgb(0xc8c8cd))
-                .child("GitHub Releases에서 최신 버전을 확인하는 중…")
+                .child(loading_indicator(
+                    "GitHub Releases에서 최신 버전을 확인하는 중",
+                ))
                 .into_any_element(),
             UpdateState::UpToDate => div()
                 .py_9()
@@ -2091,7 +2329,7 @@ impl PocketYtmApp {
                                     .rounded_full()
                                     .border_1()
                                     .border_color(rgb(0x46464c))
-                                    .hover(|style| style.bg(rgb(0x2c2c31)))
+                                    .hover(|style| style.cursor_pointer().bg(rgb(0x2c2c31)))
                                     .text_size(px(12.))
                                     .text_color(rgb(0xd6d6da))
                                     .cursor_pointer()
@@ -2111,7 +2349,7 @@ impl PocketYtmApp {
                                     .px_6()
                                     .rounded_full()
                                     .bg(rgb(0xff3157))
-                                    .hover(|style| style.bg(rgb(0xff4d6d)))
+                                    .hover(|style| style.cursor_pointer().bg(rgb(0xff4d6d)))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_size(px(12.))
                                     .text_color(rgb(0xffffff))
@@ -2127,13 +2365,12 @@ impl PocketYtmApp {
             UpdateState::Installing(version) => div()
                 .py_10()
                 .text_center()
-                .child(
-                    div()
-                        .text_size(px(18.))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(0xf5f5f6))
-                        .child(format!("v{version} 업데이트 설치 준비 중…")),
-                )
+                .text_size(px(18.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(0xf5f5f6))
+                .child(loading_indicator(format!(
+                    "v{version} 업데이트 설치 준비 중"
+                )))
                 .child(
                     div()
                         .mt_2()
@@ -2164,7 +2401,7 @@ impl PocketYtmApp {
                         .h(px(40.))
                         .rounded_full()
                         .bg(rgb(0x2c2c31))
-                        .hover(|style| style.bg(rgb(0x38383e)))
+                        .hover(|style| style.cursor_pointer().bg(rgb(0x38383e)))
                         .text_size(px(12.))
                         .cursor_pointer()
                         .child("다시 확인")
@@ -2227,7 +2464,9 @@ impl PocketYtmApp {
                                             .size(px(34.))
                                             .rounded_full()
                                             .bg(rgb(0x2a2a2f))
-                                            .hover(|style| style.bg(rgb(0x39393f)))
+                                            .hover(|style| {
+                                                style.cursor_pointer().bg(rgb(0x39393f))
+                                            })
                                             .text_color(rgb(0xc8c8cc))
                                             .cursor_pointer()
                                             .child("×")
@@ -2266,6 +2505,37 @@ impl PocketYtmApp {
             .seek_drag_fraction
             .map(|fraction| state.duration.mul_f64(fraction))
             .unwrap_or(state.position);
+        let playback_detail = match state.phase {
+            PlaybackPhase::Loading => div()
+                .mt_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(px(11.))
+                .text_color(rgb(0xff8ca0))
+                .child(Spinner::new().with_size(px(12.)))
+                .child("스트림 준비 중")
+                .into_any_element(),
+            PlaybackPhase::Error => div()
+                .mt_1()
+                .truncate()
+                .text_size(px(11.))
+                .text_color(rgb(0xff8ca0))
+                .child(
+                    state
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "재생하지 못했습니다.".into()),
+                )
+                .into_any_element(),
+            _ => div()
+                .mt_1()
+                .truncate()
+                .text_size(px(11.))
+                .text_color(rgb(0x88888f))
+                .child(item.subtitle.clone())
+                .into_any_element(),
+        };
         let mut seek_targets = Vec::new();
         for index in 0..128 {
             let fraction = (index as f64 + 0.5) / 128.0;
@@ -2275,6 +2545,7 @@ impl PocketYtmApp {
                     .h(px(14.))
                     .flex_1()
                     .cursor_pointer()
+                    .hover(|style| style.cursor_pointer())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -2303,12 +2574,7 @@ impl PocketYtmApp {
         }
 
         div()
-            .absolute()
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .h(px(112.))
-            .occlude()
+            .size_full()
             .bg(rgb(0x1b1b1e))
             .border_t_1()
             .border_color(rgb(0x34343a))
@@ -2329,6 +2595,7 @@ impl PocketYtmApp {
                     .relative()
                     .h(px(14.))
                     .cursor_pointer()
+                    .hover(|style| style.cursor_pointer())
                     .child(
                         div()
                             .absolute()
@@ -2374,14 +2641,7 @@ impl PocketYtmApp {
                                             .text_color(rgb(0xf4f4f5))
                                             .child(item.title.clone()),
                                     )
-                                    .child(
-                                        div()
-                                            .mt_1()
-                                            .truncate()
-                                            .text_size(px(11.))
-                                            .text_color(rgb(0x88888f))
-                                            .child(item.subtitle.clone()),
-                                    ),
+                                    .child(playback_detail),
                             )
                             .child(
                                 div()
@@ -2390,6 +2650,7 @@ impl PocketYtmApp {
                                     .text_size(px(18.))
                                     .text_color(if liked { rgb(0xff3157) } else { rgb(0x8a8a91) })
                                     .cursor_pointer()
+                                    .hover(|style| style.cursor_pointer())
                                     .child(if liked { "♥" } else { "♡" })
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_like(cx))),
                             ),
@@ -2416,6 +2677,7 @@ impl PocketYtmApp {
                                                 rgb(0x929299)
                                             })
                                             .cursor_pointer()
+                                            .hover(|style| style.cursor_pointer())
                                             .child("⤨")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.shuffle = !this.shuffle;
@@ -2428,8 +2690,12 @@ impl PocketYtmApp {
                                             .text_size(px(22.))
                                             .text_color(rgb(0xd6d6da))
                                             .cursor_pointer()
+                                            .hover(|style| style.cursor_pointer())
                                             .child("◀")
-                                            .on_click(cx.listener(|this, _, _, _| this.previous())),
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, _| this.previous()),
+                                            ),
                                     )
                                     .child(
                                         div()
@@ -2443,15 +2709,17 @@ impl PocketYtmApp {
                                             .text_color(rgb(0x151517))
                                             .text_size(px(17.))
                                             .cursor_pointer()
+                                            .hover(|style| style.cursor_pointer())
                                             .child(if state.phase == PlaybackPhase::Loading {
-                                                "…"
+                                                Spinner::new().small().into_any_element()
                                             } else if playing {
-                                                "Ⅱ"
+                                                div().child("Ⅱ").into_any_element()
                                             } else {
-                                                "▶"
+                                                div().child("▶").into_any_element()
                                             })
-                                            .on_click(
-                                                cx.listener(|this, _, _, _| this.audio.toggle()),
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, _| this.toggle_playback()),
                                             ),
                                     )
                                     .child(
@@ -2460,8 +2728,12 @@ impl PocketYtmApp {
                                             .text_size(px(22.))
                                             .text_color(rgb(0xd6d6da))
                                             .cursor_pointer()
+                                            .hover(|style| style.cursor_pointer())
                                             .child("▶")
-                                            .on_click(cx.listener(|this, _, _, _| this.next())),
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, _| this.next()),
+                                            ),
                                     )
                                     .child(
                                         div()
@@ -2472,6 +2744,7 @@ impl PocketYtmApp {
                                                 rgb(0xff3157)
                                             })
                                             .cursor_pointer()
+                                            .hover(|style| style.cursor_pointer())
                                             .child(if self.repeat == RepeatMode::One {
                                                 "↻¹"
                                             } else {
@@ -2512,6 +2785,7 @@ impl PocketYtmApp {
                                         rgb(0xa0a0a7)
                                     })
                                     .cursor_pointer()
+                                    .hover(|style| style.cursor_pointer())
                                     .child("가사")
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_lyrics(cx))),
                             )
@@ -2525,6 +2799,7 @@ impl PocketYtmApp {
                                         rgb(0xa0a0a7)
                                     })
                                     .cursor_pointer()
+                                    .hover(|style| style.cursor_pointer())
                                     .child("☷")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.show_queue = !this.show_queue;
@@ -2537,6 +2812,7 @@ impl PocketYtmApp {
                                     .id("volume-down")
                                     .text_color(rgb(0xa0a0a7))
                                     .cursor_pointer()
+                                    .hover(|style| style.cursor_pointer())
                                     .child("−")
                                     .on_click(cx.listener(|this, _, _, _| {
                                         this.audio.set_volume(this.audio_snapshot.volume - 0.1)
@@ -2561,6 +2837,7 @@ impl PocketYtmApp {
                                     .id("volume-up")
                                     .text_color(rgb(0xa0a0a7))
                                     .cursor_pointer()
+                                    .hover(|style| style.cursor_pointer())
                                     .child("+")
                                     .on_click(cx.listener(|this, _, _, _| {
                                         this.audio.set_volume(this.audio_snapshot.volume + 0.1)
@@ -2574,6 +2851,9 @@ impl PocketYtmApp {
 
 impl Render for PocketYtmApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content_image_generation = self.content_image_generation;
+        let queue_image_generation = self.watch_queue_request;
+        let player_image_generation = self.audio_snapshot.generation;
         div()
             .relative()
             .key_context("PocketYtm")
@@ -2601,11 +2881,37 @@ impl Render for PocketYtmApp {
                             .flex()
                             .flex_1()
                             .min_h_0()
-                            .child(self.render_center(cx))
-                            .children(self.render_side_panel(cx)),
+                            .child(
+                                image_cache(retain_all((
+                                    "content-images",
+                                    content_image_generation,
+                                )))
+                                .child(self.render_center(cx)),
+                            )
+                            .children(self.render_side_panel(cx).map(|panel| {
+                                image_cache(retain_all((
+                                    "side-panel-images",
+                                    queue_image_generation,
+                                )))
+                                .child(panel)
+                                .into_any_element()
+                            })),
                     ),
             )
-            .child(self.render_player(cx))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(112.))
+                    .occlude()
+                    .child(
+                        image_cache(retain_all(("player-images", player_image_generation)))
+                            .size_full()
+                            .child(self.render_player(cx)),
+                    ),
+            )
             .children(self.render_auth_modal(cx))
             .children(self.render_update_modal(cx))
     }

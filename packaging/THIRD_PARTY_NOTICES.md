@@ -5,9 +5,8 @@ need Python, Homebrew, yt-dlp, FFmpeg, or a JavaScript runtime installed.
 
 - ytmusicapi 1.12.2 — MIT
 - CPython 3.12 runtime and Python packages collected by PyInstaller 6.22.2
-- yt-dlp 2026.07.04 official macOS standalone executable — Unlicense; the
-  official PyInstaller bundle contains GPLv3+ components and is distributed
-  under GPLv3+
+- yt-dlp 2026.07.04 embedded in the persistent PyInstaller resolver — Unlicense;
+  optional bundled components retain their respective upstream licenses
 - FFmpeg 9.0.1 built without GPL or external libraries — LGPL-2.1-or-later
 - Deno 2.9.5 — MIT
 

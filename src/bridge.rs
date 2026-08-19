@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -22,6 +23,7 @@ pub struct YtMusicBridge {
     config: AppConfig,
     entrypoint: PathBuf,
     process: Mutex<Option<Sidecar>>,
+    query_cache: Mutex<HashMap<String, Value>>,
     next_id: AtomicU64,
 }
 
@@ -47,40 +49,41 @@ impl YtMusicBridge {
             config,
             entrypoint: bridge_entrypoint_path(),
             process: Mutex::new(None),
+            query_cache: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         })
     }
 
     pub fn home(&self) -> Result<Vec<MediaSection>> {
-        self.request("home", json!({"limit": 8}))
+        self.query("home", json!({"limit": 8}))
     }
 
-    pub fn auth_status(&self) -> Result<AccountStatus> {
-        self.request("authStatus", json!({}))
+    pub fn cached_auth_status(&self) -> AccountStatus {
+        cached_auth_status(&self.config.auth_path)
     }
 
     pub fn authenticate(&self, headers: &str) -> Result<AccountStatus> {
-        self.request("authenticate", json!({"headers": headers}))
+        self.mutation("authenticate", json!({"headers": headers}))
     }
 
     pub fn logout(&self) -> Result<AccountStatus> {
-        self.request("logout", json!({}))
+        self.mutation("logout", json!({}))
     }
 
     pub fn explore(&self) -> Result<Vec<MediaSection>> {
-        self.request("explore", json!({}))
+        self.query("explore", json!({}))
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<MediaItem>> {
-        self.request("search", json!({"query": query, "limit": 40}))
+        self.query("search", json!({"query": query, "limit": 40}))
     }
 
     pub fn library(&self, category: &str) -> Result<Vec<MediaSection>> {
-        self.request("library", json!({"category": category, "limit": 100}))
+        self.query("library", json!({"category": category, "limit": 100}))
     }
 
     pub fn browse(&self, item: &MediaItem) -> Result<BrowsePage> {
-        self.request(
+        self.query(
             "browse",
             json!({
                 "kind": item.kind,
@@ -91,28 +94,46 @@ impl YtMusicBridge {
     }
 
     pub fn watch_queue(&self, video_id: &str) -> Result<WatchQueue> {
-        self.request("watch", json!({"videoId": video_id, "limit": 50}))
+        self.query("watch", json!({"videoId": video_id, "limit": 50}))
     }
 
     pub fn playlist_queue(&self, playlist_id: &str) -> Result<WatchQueue> {
-        self.request(
+        self.query(
             "playlistQueue",
             json!({"playlistId": playlist_id, "limit": 50}),
         )
     }
 
     pub fn lyrics(&self, browse_id: &str) -> Result<Lyrics> {
-        self.request("lyrics", json!({"browseId": browse_id}))
+        self.query("lyrics", json!({"browseId": browse_id}))
     }
 
     pub fn rate_song(&self, video_id: &str, rating: &str) -> Result<Value> {
-        self.request("rateSong", json!({"videoId": video_id, "rating": rating}))
+        self.mutation("rateSong", json!({"videoId": video_id, "rating": rating}))
     }
 
-    fn request<T: DeserializeOwned>(&self, op: &str, params: Value) -> Result<T> {
+    fn query<T: DeserializeOwned>(&self, op: &str, params: Value) -> Result<T> {
+        self.request(op, params, true)
+    }
+
+    fn mutation<T: DeserializeOwned>(&self, op: &str, params: Value) -> Result<T> {
+        self.request(op, params, false)
+    }
+
+    fn request<T: DeserializeOwned>(&self, op: &str, params: Value, cacheable: bool) -> Result<T> {
+        let cache_key = cacheable.then(|| query_key(op, &params));
+        // The process lock also acts as an in-flight query lock. Once one query
+        // finishes, another caller with the same key observes its cached value.
+        let mut guard = self.process.lock();
+        if let Some(cache_key) = &cache_key
+            && let Some(cached) = self.query_cache.lock().get(cache_key).cloned()
+        {
+            return serde_json::from_value(cached)
+                .context("캐시된 ytmusicapi 응답 형식이 올바르지 않습니다");
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = json!({"id": id, "op": op, "params": params});
-        let mut guard = self.process.lock();
 
         for attempt in 0..2 {
             if guard.is_none() {
@@ -131,8 +152,15 @@ impl YtMusicBridge {
                     if !envelope.ok {
                         bail!(envelope.error);
                     }
-                    return serde_json::from_value(envelope.data)
-                        .context("ytmusicapi 응답 형식이 올바르지 않습니다");
+                    let parsed = serde_json::from_value(envelope.data.clone())
+                        .context("ytmusicapi 응답 형식이 올바르지 않습니다")?;
+                    let mut cache = self.query_cache.lock();
+                    if let Some(cache_key) = &cache_key {
+                        cache.insert(cache_key.clone(), envelope.data);
+                    } else {
+                        cache.clear();
+                    }
+                    return Ok(parsed);
                 }
                 Err(error) if attempt == 0 => {
                     log::warn!("restarting ytmusic sidecar after error: {error:#}");
@@ -187,6 +215,51 @@ impl YtMusicBridge {
     }
 }
 
+fn cached_auth_status(auth_path: &std::path::Path) -> AccountStatus {
+    if !auth_path.is_file() {
+        return AccountStatus::default();
+    }
+    let account_path = auth_path.with_file_name("account.json");
+    let account = std::fs::read_to_string(account_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+        .unwrap_or_default();
+    let text = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| account.get(key).and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let thumbnail = text(&["accountPhotoUrl", "thumbnail"]);
+    AccountStatus {
+        authenticated: true,
+        name: text(&["accountName", "name"]),
+        handle: text(&["channelHandle", "handle"]),
+        thumbnail: (!thumbnail.is_empty()).then_some(thumbnail),
+    }
+}
+
+fn query_key(op: &str, params: &Value) -> String {
+    let params = canonical_json(params);
+    serde_json::to_string(&(op, params)).expect("serializing a JSON query key cannot fail")
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json(&object[key]));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        _ => value.clone(),
+    }
+}
+
 fn bridge_entrypoint_path() -> PathBuf {
     if let Some(path) = std::env::var_os("POCKET_YTM_BRIDGE") {
         return PathBuf::from(path);
@@ -238,5 +311,58 @@ impl Drop for Sidecar {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn query_keys_include_operation_and_parameters() {
+        let first = query_key("search", &json!({"query": "cover", "limit": 40}));
+        let same = query_key("search", &json!({"limit": 40, "query": "cover"}));
+        let different = query_key("search", &json!({"query": "nightcore", "limit": 40}));
+
+        assert_eq!(first, same);
+        assert_ne!(first, different);
+        assert_ne!(
+            first,
+            query_key("browse", &json!({"query": "cover", "limit": 40}))
+        );
+    }
+
+    #[test]
+    fn cached_account_restores_without_starting_the_sidecar() {
+        let directory = tempdir().unwrap();
+        let auth_path = directory.path().join("auth.json");
+        std::fs::write(&auth_path, "{}").unwrap();
+        std::fs::write(
+            directory.path().join("account.json"),
+            r#"{"accountName":"Cached User","channelHandle":"@cached","accountPhotoUrl":"https://example.test/avatar"}"#,
+        )
+        .unwrap();
+
+        let status = cached_auth_status(&auth_path);
+
+        assert!(status.authenticated);
+        assert_eq!(status.name, "Cached User");
+        assert_eq!(status.handle, "@cached");
+        assert_eq!(
+            status.thumbnail.as_deref(),
+            Some("https://example.test/avatar")
+        );
+    }
+
+    #[test]
+    fn missing_auth_file_is_logged_out_even_with_stale_account_metadata() {
+        let directory = tempdir().unwrap();
+        std::fs::write(directory.path().join("account.json"), r#"{"name":"Stale"}"#).unwrap();
+
+        assert_eq!(
+            cached_auth_status(&directory.path().join("auth.json")),
+            AccountStatus::default()
+        );
     }
 }

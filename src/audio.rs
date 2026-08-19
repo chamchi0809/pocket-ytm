@@ -10,7 +10,13 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use parking_lot::RwLock;
+use reqwest::{
+    StatusCode,
+    blocking::Client as BlockingClient,
+    header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderName, HeaderValue, RANGE},
+};
 use rodio::{
     Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source,
     cpal::{self, traits::DeviceTrait as _, traits::HostTrait as _},
@@ -23,11 +29,16 @@ use stream_download::{
     storage::temp::TempStorageProvider,
 };
 
-use crate::{config::AppConfig, model::MediaItem};
+use crate::{
+    config::AppConfig,
+    model::MediaItem,
+    resolver::{MediaResolver, ResolvedMedia},
+};
 
 const MEDIA_STREAM_FLAG: &str = "--pocket-music-media-stream";
 const SESSION_CACHE_PREFIX: &str = "pocket-music-session-";
 const STREAM_PREFETCH_BYTES: u64 = 1024 * 128;
+const HTTP_RANGE_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 const PREFETCH_START_DELAY: Duration = Duration::from_secs(1);
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -76,7 +87,7 @@ pub struct AudioEngine {
 }
 
 enum AudioCommand {
-    Load(MediaItem),
+    Load(LoadRequest),
     Prefetch(Vec<MediaItem>),
     Toggle,
     Seek(Duration),
@@ -103,6 +114,8 @@ type NativeSource = Box<dyn Source + Send>;
 impl AudioEngine {
     pub fn new(config: AppConfig) -> Self {
         purge_session_cache_dirs(&std::env::temp_dir());
+        let resolver = MediaResolver::new(&config);
+        resolver.warm_up();
         let session_cache = Arc::new(
             tempfile::Builder::new()
                 .prefix(SESSION_CACHE_PREFIX)
@@ -119,7 +132,7 @@ impl AudioEngine {
         let thread_cache = session_cache.clone();
         thread::Builder::new()
             .name("pocket-ytm-audio".into())
-            .spawn(move || audio_loop(config, thread_cache, rx, thread_snapshot))
+            .spawn(move || audio_loop(config, resolver, thread_cache, rx, thread_snapshot))
             .expect("failed to start native audio thread");
         Self {
             tx,
@@ -133,7 +146,27 @@ impl AudioEngine {
     }
 
     pub fn load(&self, item: MediaItem) {
-        let _ = self.tx.send(AudioCommand::Load(item));
+        let generation = {
+            let mut state = self.snapshot.write();
+            state.generation = state.generation.wrapping_add(1);
+            state.phase = PlaybackPhase::Loading;
+            state.position = Duration::ZERO;
+            state.duration = item
+                .duration_seconds
+                .map(Duration::from_secs)
+                .unwrap_or_default();
+            state.item = Some(item.clone());
+            state.error = None;
+            state.generation
+        };
+        let request = LoadRequest { generation, item };
+        if self.tx.send(AudioCommand::Load(request)).is_err() {
+            set_error(
+                &self.snapshot,
+                "재생 엔진이 종료되어 재생 명령을 전달하지 못했습니다. 앱을 다시 실행해 주세요."
+                    .into(),
+            );
+        }
     }
 
     pub fn prefetch(&self, items: Vec<MediaItem>) {
@@ -172,6 +205,7 @@ fn purge_session_cache_dirs(root: &Path) {
 
 fn audio_loop(
     config: AppConfig,
+    resolver: Arc<MediaResolver>,
     session_cache: Arc<tempfile::TempDir>,
     rx: mpsc::Receiver<AudioCommand>,
     snapshot: Arc<RwLock<AudioSnapshot>>,
@@ -187,24 +221,43 @@ fn audio_loop(
     let (load_tx, load_rx) = mpsc::channel();
     let (prepared_tx, prepared_rx) = mpsc::channel();
     let loader_config = config.clone();
+    let loader_resolver = resolver.clone();
     let loader_cache = session_cache.clone();
     thread::Builder::new()
         .name("pocket-ytm-source-loader".into())
-        .spawn(move || source_loader_loop(loader_config, loader_cache, load_rx, prepared_tx))
+        .spawn(move || {
+            source_loader_loop(
+                loader_config,
+                loader_resolver,
+                loader_cache,
+                load_rx,
+                prepared_tx,
+            )
+        })
         .expect("failed to start source loader");
 
     let (prefetch_tx, prefetch_rx) = mpsc::channel();
     let prefetch_config = config.clone();
+    let prefetch_resolver = resolver;
     let prefetch_cache = session_cache.clone();
     thread::Builder::new()
         .name("pocket-ytm-prefetch".into())
-        .spawn(move || prefetch_loop(prefetch_config, prefetch_cache, prefetch_rx))
+        .spawn(move || {
+            prefetch_loop(
+                prefetch_config,
+                prefetch_resolver,
+                prefetch_cache,
+                prefetch_rx,
+            )
+        })
         .expect("failed to start source prefetcher");
 
     let mut empty_since = None;
     let mut suppress_empty_until = Instant::now();
     let mut pending_load: Option<LoadRequest> = None;
     let mut next_output_retry = Instant::now();
+    let mut attached_generation = None;
+    let mut attached_at = None;
 
     loop {
         if output.is_none() && pending_load.is_some() && Instant::now() >= next_output_retry {
@@ -230,36 +283,33 @@ fn audio_loop(
         }
 
         if let Some(output) = &output
-            && apply_prepared_sources(&prepared_rx, &output.player, &snapshot)
+            && let Some(generation) =
+                apply_prepared_sources(&prepared_rx, &output.player, &snapshot)
         {
+            attached_generation = Some(generation);
+            attached_at = Some(Instant::now());
             empty_since = None;
             suppress_empty_until = Instant::now() + Duration::from_secs(1);
         }
 
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(AudioCommand::Load(item)) => {
+            Ok(AudioCommand::Load(request)) => {
                 if let Some(output) = &output {
                     output.player.stop();
                 }
                 empty_since = None;
+                attached_generation = None;
+                attached_at = None;
                 suppress_empty_until = Instant::now() + Duration::from_secs(1);
-                let generation = {
-                    let mut state = snapshot.write();
-                    state.generation += 1;
-                    state.phase = PlaybackPhase::Loading;
-                    state.position = Duration::ZERO;
-                    state.duration = item
-                        .duration_seconds
-                        .map(Duration::from_secs)
-                        .unwrap_or_default();
-                    state.item = Some(item.clone());
-                    state.error = None;
-                    state.generation
-                };
-                let request = LoadRequest { generation, item };
                 if output.is_some() {
-                    let _ = load_tx.send(request);
-                    pending_load = None;
+                    if load_tx.send(request).is_err() {
+                        set_error(
+                            &snapshot,
+                            "오디오 소스 로더가 종료되어 스트림을 준비하지 못했습니다.".into(),
+                        );
+                    } else {
+                        pending_load = None;
+                    }
                 } else {
                     pending_load = Some(request);
                     next_output_retry = Instant::now();
@@ -311,13 +361,25 @@ fn audio_loop(
         }
 
         if let Some(output) = &output {
-            if apply_prepared_sources(&prepared_rx, &output.player, &snapshot) {
+            if let Some(generation) =
+                apply_prepared_sources(&prepared_rx, &output.player, &snapshot)
+            {
+                attached_generation = Some(generation);
+                attached_at = Some(Instant::now());
                 empty_since = None;
                 suppress_empty_until = Instant::now() + Duration::from_secs(1);
             }
             let mut state = snapshot.write();
-            if matches!(state.phase, PlaybackPhase::Playing | PlaybackPhase::Paused) {
+            let attached_loading = state.phase == PlaybackPhase::Loading
+                && attached_generation == Some(state.generation);
+            if attached_loading
+                || matches!(state.phase, PlaybackPhase::Playing | PlaybackPhase::Paused)
+            {
                 state.position = output.player.get_pos();
+                if attached_loading && !state.position.is_zero() && !output.player.empty() {
+                    state.phase = PlaybackPhase::Playing;
+                    attached_at = None;
+                }
                 if output.player.empty() {
                     let now = Instant::now();
                     if now >= suppress_empty_until {
@@ -343,6 +405,15 @@ fn audio_loop(
                     }
                 } else {
                     empty_since = None;
+                    if state.phase == PlaybackPhase::Loading
+                        && attached_at
+                            .is_some_and(|started| started.elapsed() >= Duration::from_secs(15))
+                    {
+                        state.phase = PlaybackPhase::Error;
+                        state.error = Some(
+                            "오디오 디코더가 15초 동안 재생 샘플을 공급하지 못했습니다.".into(),
+                        );
+                    }
                 }
             }
         }
@@ -424,6 +495,7 @@ fn classify_empty_source(elapsed: Duration, position: Duration, duration: Durati
 
 fn source_loader_loop(
     config: AppConfig,
+    resolver: Arc<MediaResolver>,
     session_cache: Arc<tempfile::TempDir>,
     rx: mpsc::Receiver<LoadRequest>,
     tx: mpsc::Sender<PreparedSource>,
@@ -447,8 +519,14 @@ fn source_loader_loop(
         while let Ok(newer) = rx.try_recv() {
             request = newer;
         }
-        let result = open_source(&runtime, &config, session_cache.path(), &request.item)
-            .map_err(|error| format!("{error:#}"));
+        let result = open_source(
+            &runtime,
+            &config,
+            &resolver,
+            session_cache.path(),
+            &request.item,
+        )
+        .map_err(|error| format!("{error:#}"));
         if tx
             .send(PreparedSource {
                 generation: request.generation,
@@ -465,8 +543,8 @@ fn apply_prepared_sources(
     rx: &mpsc::Receiver<PreparedSource>,
     player: &Player,
     snapshot: &RwLock<AudioSnapshot>,
-) -> bool {
-    let mut started = false;
+) -> Option<u64> {
+    let mut attached = None;
     for prepared in rx.try_iter() {
         let current_generation = snapshot.read().generation;
         if prepared.generation != current_generation {
@@ -487,17 +565,21 @@ fn apply_prepared_sources(
                 {
                     state.duration = duration;
                 }
-                state.phase = PlaybackPhase::Playing;
-                started = true;
+                // Appending a decoder only means that the source is attached. Keep
+                // showing Loading until the audio device reports a non-zero playback
+                // position, which proves that actual samples reached the mixer.
+                state.phase = PlaybackPhase::Loading;
+                attached = Some(prepared.generation);
             }
             Err(error) => set_error(snapshot, format!("재생 스트림을 열 수 없습니다: {error}")),
         }
     }
-    started
+    attached
 }
 
 fn prefetch_loop(
     config: AppConfig,
+    resolver: Arc<MediaResolver>,
     session_cache: Arc<tempfile::TempDir>,
     rx: mpsc::Receiver<Vec<MediaItem>>,
 ) {
@@ -547,19 +629,21 @@ fn prefetch_loop(
             if paths.audio.is_file() {
                 continue;
             }
-            let mut command = match media_helper_command(
-                &config,
-                &url,
-                "bestaudio/best",
-                &paths.audio,
-                &paths.duration,
-            ) {
-                Ok(command) => command,
+            let resolved = match resolver.resolve(&url, "bestaudio/best") {
+                Ok(resolved) => resolved,
                 Err(error) => {
-                    log::warn!("prefetch helper unavailable: {error:#}");
+                    log::warn!("track prefetch resolution failed: {error:#}");
                     continue;
                 }
             };
+            let mut command =
+                match media_helper_command(&config, &resolved, &paths.audio, &paths.duration) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        log::warn!("prefetch helper unavailable: {error:#}");
+                        continue;
+                    }
+                };
             let mut child = match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
                 Ok(child) => child,
                 Err(error) => {
@@ -628,18 +712,28 @@ fn cache_paths(root: &Path, item: &MediaItem) -> CachePaths {
 fn open_source(
     runtime: &tokio::runtime::Runtime,
     config: &AppConfig,
+    resolver: &MediaResolver,
     cache_root: &Path,
     item: &MediaItem,
 ) -> Result<(NativeSource, Option<Duration>)> {
     let url = item
         .watch_url()
         .context("선택한 항목에 YouTube videoId가 없습니다")?;
-    open_source_with_format(runtime, config, cache_root, item, &url, "bestaudio/best")
+    open_source_with_format(
+        runtime,
+        config,
+        resolver,
+        cache_root,
+        item,
+        &url,
+        "bestaudio/best",
+    )
 }
 
 fn open_source_with_format(
     runtime: &tokio::runtime::Runtime,
     config: &AppConfig,
+    resolver: &MediaResolver,
     cache_root: &Path,
     item: &MediaItem,
     url: &str,
@@ -653,13 +747,20 @@ fn open_source_with_format(
         return Ok((Box::new(decoder), read_duration(&paths.duration)));
     }
 
+    let resolved = resolver
+        .resolve(url, format)
+        .context("yt-dlp가 재생 URL을 해석하지 못했습니다")?;
+    let resolved_duration = resolved
+        .duration_seconds
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(Duration::from_secs_f64);
     let stderr_file =
         tempfile::NamedTempFile::new().context("오디오 오류 로그를 만들지 못했습니다")?;
     let stderr_handle = stderr_file
         .as_file()
         .try_clone()
         .context("오디오 오류 로그를 복제하지 못했습니다")?;
-    let helper = media_helper_command(config, url, format, &paths.audio, &paths.duration)?;
+    let helper = media_helper_command(config, &resolved, &paths.audio, &paths.duration)?;
     let helper = StreamCommand::new(helper.get_program())
         .args(helper.get_args())
         .stderr_handle(Stdio::from(stderr_handle));
@@ -690,10 +791,13 @@ fn open_source_with_format(
                     .context("ffmpeg가 재생 가능한 오디오 스트림을 만들지 못했습니다");
             }
             let concise = stderr.lines().last().unwrap_or(stderr);
-            anyhow::bail!("yt-dlp가 오디오를 내려받지 못했습니다: {concise}");
+            anyhow::bail!("오디오를 스트리밍하지 못했습니다: {concise}");
         }
     };
-    Ok((Box::new(decoder), read_duration(&paths.duration)))
+    Ok((
+        Box::new(decoder),
+        resolved_duration.or_else(|| read_duration(&paths.duration)),
+    ))
 }
 
 fn read_duration(path: &Path) -> Option<Duration> {
@@ -706,34 +810,29 @@ fn read_duration(path: &Path) -> Option<Duration> {
 
 fn media_helper_command(
     config: &AppConfig,
-    url: &str,
-    format: &str,
+    media: &ResolvedMedia,
     cache_path: &Path,
     duration_path: &Path,
 ) -> Result<StdCommand> {
     let executable = std::env::current_exe().context("현재 앱 실행 파일을 찾지 못했습니다")?;
+    let encoded_headers = BASE64.encode(
+        serde_json::to_vec(&media.headers).context("오디오 요청 헤더를 직렬화하지 못했습니다")?,
+    );
     let mut command = StdCommand::new(executable);
     command
         .arg(MEDIA_STREAM_FLAG)
-        .arg("--yt-dlp")
-        .arg(&config.yt_dlp)
         .arg("--ffmpeg")
         .arg(&config.ffmpeg)
-        .arg("--url")
-        .arg(url)
-        .arg("--format")
-        .arg(format)
+        .arg("--media-url")
+        .arg(&media.url)
+        .arg("--headers")
+        .arg(encoded_headers)
         .arg("--cache")
         .arg(cache_path)
         .arg("--duration")
         .arg(duration_path);
-    if let Some(deno) = &config.deno {
-        command.arg("--deno").arg(deno);
-    }
-    if let Some(cookies) = &config.cookies_path
-        && cookies.exists()
-    {
-        command.arg("--cookies").arg(cookies);
+    if let Some(duration) = media.duration_seconds {
+        command.arg("--media-duration").arg(duration.to_string());
     }
     Ok(command)
 }
@@ -761,41 +860,10 @@ fn media_stream_main(args: impl Iterator<Item = OsString>) -> Result<()> {
     let process_id = std::process::id();
     let cache_part = sibling_temp_path(&args.cache, process_id, "part");
     let duration_part = sibling_temp_path(&args.duration, process_id, "metadata");
-
-    let mut yt_dlp = StdCommand::new(&args.yt_dlp);
-    yt_dlp
-        .arg(&args.url)
-        .args([
-            "--quiet",
-            "--ignore-config",
-            "--no-update",
-            "--no-part",
-            "--no-continue",
-            "--no-playlist",
-        ])
-        .args(["-f", &args.format, "-o", "-"])
-        .arg("--ffmpeg-location")
-        .arg(&args.ffmpeg)
-        .arg("--print-to-file")
-        .arg("before_dl:%(duration)s")
-        .arg(&duration_part)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    if let Some(cookies) = &args.cookies {
-        yt_dlp.arg("--cookies").arg(cookies);
+    if let Some(duration) = args.media_duration {
+        std::fs::write(&duration_part, format!("{duration}\n"))
+            .context("오디오 길이 메타데이터를 저장하지 못했습니다")?;
     }
-    if let Some(deno) = &args.deno {
-        yt_dlp
-            .arg("--js-runtimes")
-            .arg(format!("deno:{}", deno.display()));
-    }
-    let mut yt_dlp = yt_dlp
-        .spawn()
-        .with_context(|| format!("'{}' 실행 파일을 시작하지 못했습니다", args.yt_dlp))?;
-    let yt_stdout = yt_dlp
-        .stdout
-        .take()
-        .context("yt-dlp 오디오 출력을 열지 못했습니다")?;
 
     let mut ffmpeg = StdCommand::new(&args.ffmpeg)
         .args([
@@ -812,11 +880,21 @@ fn media_stream_main(args: impl Iterator<Item = OsString>) -> Result<()> {
             "pcm_s16le",
             "-",
         ])
-        .stdin(Stdio::from(yt_stdout))
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("'{}' 실행 파일을 시작하지 못했습니다", args.ffmpeg))?;
+    let ffmpeg_stdin = ffmpeg
+        .stdin
+        .take()
+        .context("ffmpeg 오디오 입력을 열지 못했습니다")?;
+    let media_url = args.media_url.clone();
+    let media_headers = args.headers.clone();
+    let download = thread::Builder::new()
+        .name("pocket-ytm-range-download".into())
+        .spawn(move || stream_http_ranges(&media_url, &media_headers, ffmpeg_stdin))
+        .context("Rust 오디오 다운로드 스레드를 시작하지 못했습니다")?;
     let mut ffmpeg_stdout = ffmpeg
         .stdout
         .take()
@@ -854,14 +932,13 @@ fn media_stream_main(args: impl Iterator<Item = OsString>) -> Result<()> {
 
     if copy_result.is_err() {
         let _ = ffmpeg.kill();
-        let _ = yt_dlp.kill();
     }
     let ffmpeg_status = ffmpeg
         .wait()
         .context("ffmpeg 종료 상태를 읽지 못했습니다")?;
-    let yt_dlp_status = yt_dlp
-        .wait()
-        .context("yt-dlp 종료 상태를 읽지 못했습니다")?;
+    let download_result = download
+        .join()
+        .map_err(|_| anyhow::anyhow!("Rust 오디오 다운로드 스레드가 중단되었습니다"))?;
     publish_duration(&duration_part, &args.duration);
 
     if let Err(error) = copy_result {
@@ -869,12 +946,15 @@ fn media_stream_main(args: impl Iterator<Item = OsString>) -> Result<()> {
         let _ = std::fs::remove_file(&duration_part);
         return Err(error);
     }
-    if !yt_dlp_status.success() || !ffmpeg_status.success() || written <= 44 {
+    if let Err(error) = download_result {
         let _ = std::fs::remove_file(&cache_part);
         let _ = std::fs::remove_file(&duration_part);
-        anyhow::bail!(
-            "오디오 파이프라인이 완료되지 않았습니다 (yt-dlp: {yt_dlp_status}, ffmpeg: {ffmpeg_status})"
-        );
+        return Err(error);
+    }
+    if !ffmpeg_status.success() || written <= 44 {
+        let _ = std::fs::remove_file(&cache_part);
+        let _ = std::fs::remove_file(&duration_part);
+        anyhow::bail!("오디오 파이프라인이 완료되지 않았습니다 (ffmpeg: {ffmpeg_status})");
     }
 
     if args.cache.is_file() {
@@ -890,16 +970,105 @@ fn media_stream_main(args: impl Iterator<Item = OsString>) -> Result<()> {
     Ok(())
 }
 
+fn stream_http_ranges(
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    mut output: impl std::io::Write,
+) -> Result<u64> {
+    let client = BlockingClient::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("Rust 오디오 HTTP 클라이언트를 만들지 못했습니다")?;
+    let mut request_headers = HeaderMap::new();
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("오디오 요청 헤더 이름이 올바르지 않습니다: {name}"))?;
+        if name == RANGE || name == ACCEPT_ENCODING {
+            continue;
+        }
+        let value = HeaderValue::from_str(value)
+            .with_context(|| format!("오디오 요청 헤더 값이 올바르지 않습니다: {name}"))?;
+        request_headers.insert(name, value);
+    }
+
+    let mut offset = 0_u64;
+    loop {
+        let end = offset.saturating_add(HTTP_RANGE_CHUNK_BYTES - 1);
+        let mut response = client
+            .get(url)
+            .headers(request_headers.clone())
+            .header(ACCEPT_ENCODING, "identity")
+            .header(RANGE, format!("bytes={offset}-{end}"))
+            .send()
+            .context("오디오 Range 요청을 보내지 못했습니다")?;
+
+        if offset == 0 && response.status() == StatusCode::OK {
+            return std::io::copy(&mut response, &mut output)
+                .context("오디오 응답을 FFmpeg에 전달하지 못했습니다");
+        }
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            anyhow::bail!(
+                "오디오 서버가 Range 요청을 거부했습니다: {}",
+                response.status()
+            );
+        }
+
+        let content_range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .context("오디오 Range 응답에 Content-Range가 없습니다")?
+            .to_str()
+            .context("오디오 Content-Range가 올바르지 않습니다")?;
+        let (actual_start, actual_end, total) = parse_content_range(content_range)?;
+        if actual_start != offset || actual_end < actual_start {
+            anyhow::bail!(
+                "오디오 Range 순서가 올바르지 않습니다: expected {offset}, got {actual_start}-{actual_end}"
+            );
+        }
+        let expected = actual_end - actual_start + 1;
+        let copied = std::io::copy(&mut response.take(expected), &mut output)
+            .context("오디오 Range를 FFmpeg에 전달하지 못했습니다")?;
+        if copied != expected {
+            anyhow::bail!("오디오 Range가 중간에 끊겼습니다: expected {expected}, got {copied}");
+        }
+        offset = actual_end + 1;
+        if offset >= total {
+            return Ok(offset);
+        }
+    }
+}
+
+fn parse_content_range(value: &str) -> Result<(u64, u64, u64)> {
+    let value = value
+        .strip_prefix("bytes ")
+        .context("Content-Range 단위가 bytes가 아닙니다")?;
+    let (range, total) = value
+        .split_once('/')
+        .context("Content-Range 전체 길이가 없습니다")?;
+    let (start, end) = range
+        .split_once('-')
+        .context("Content-Range 범위가 없습니다")?;
+    let start = start
+        .parse()
+        .context("Content-Range 시작점이 올바르지 않습니다")?;
+    let end = end
+        .parse()
+        .context("Content-Range 끝점이 올바르지 않습니다")?;
+    let total = total
+        .parse()
+        .context("Content-Range 전체 길이가 올바르지 않습니다")?;
+    Ok((start, end, total))
+}
+
 #[derive(Debug)]
 struct MediaArgs {
-    yt_dlp: String,
     ffmpeg: String,
-    deno: Option<PathBuf>,
-    url: String,
-    format: String,
+    media_url: String,
+    headers: std::collections::BTreeMap<String, String>,
+    media_duration: Option<f64>,
     cache: PathBuf,
     duration: PathBuf,
-    cookies: Option<PathBuf>,
 }
 
 fn parse_media_args(mut args: impl Iterator<Item = OsString>) -> Result<MediaArgs> {
@@ -917,15 +1086,25 @@ fn parse_media_args(mut args: impl Iterator<Item = OsString>) -> Result<MediaArg
             .cloned()
             .with_context(|| format!("{flag} 옵션이 없습니다"))
     };
+    let encoded_headers = required("--headers")?;
+    let headers = BASE64
+        .decode(encoded_headers.to_string_lossy().as_bytes())
+        .context("오디오 요청 헤더를 디코딩하지 못했습니다")?;
+    let headers =
+        serde_json::from_slice(&headers).context("오디오 요청 헤더 형식이 올바르지 않습니다")?;
+    let media_duration = values
+        .get("--media-duration")
+        .map(|value| value.to_string_lossy().parse::<f64>())
+        .transpose()
+        .context("오디오 길이가 올바르지 않습니다")?
+        .filter(|duration| duration.is_finite() && *duration > 0.0);
     Ok(MediaArgs {
-        yt_dlp: required("--yt-dlp")?.to_string_lossy().into_owned(),
         ffmpeg: required("--ffmpeg")?.to_string_lossy().into_owned(),
-        deno: values.get("--deno").map(PathBuf::from),
-        url: required("--url")?.to_string_lossy().into_owned(),
-        format: required("--format")?.to_string_lossy().into_owned(),
+        media_url: required("--media-url")?.to_string_lossy().into_owned(),
+        headers,
+        media_duration,
         cache: PathBuf::from(required("--cache")?),
         duration: PathBuf::from(required("--duration")?),
-        cookies: values.get("--cookies").map(PathBuf::from),
     })
 }
 
@@ -1009,34 +1188,36 @@ mod tests {
 
     #[test]
     fn hidden_media_arguments_round_trip_paths() {
-        let args = [
-            "--yt-dlp",
-            "yt-dlp",
-            "--ffmpeg",
-            "ffmpeg",
-            "--deno",
-            "/Applications/Pocket Music.app/Contents/Resources/bin/deno",
-            "--url",
-            "https://music.youtube.com/watch?v=abc",
-            "--format",
-            "bestaudio/best",
-            "--cache",
-            "/tmp/cache.wav",
-            "--duration",
-            "/tmp/cache.duration",
+        let encoded_headers = BASE64.encode(br#"{"User-Agent":"Pocket Test"}"#);
+        let args = vec![
+            OsString::from("--ffmpeg"),
+            OsString::from("ffmpeg"),
+            OsString::from("--media-url"),
+            OsString::from("https://media.example/audio"),
+            OsString::from("--headers"),
+            OsString::from(encoded_headers),
+            OsString::from("--media-duration"),
+            OsString::from("42.5"),
+            OsString::from("--cache"),
+            OsString::from("/tmp/cache.wav"),
+            OsString::from("--duration"),
+            OsString::from("/tmp/cache.duration"),
         ]
-        .into_iter()
-        .map(OsString::from);
+        .into_iter();
         let parsed = parse_media_args(args).unwrap();
         assert_eq!(parsed.cache, Path::new("/tmp/cache.wav"));
         assert_eq!(parsed.duration, Path::new("/tmp/cache.duration"));
+        assert_eq!(parsed.media_duration, Some(42.5));
+        assert_eq!(parsed.headers.get("User-Agent").unwrap(), "Pocket Test");
+    }
+
+    #[test]
+    fn parses_http_content_ranges() {
         assert_eq!(
-            parsed.deno.as_deref(),
-            Some(Path::new(
-                "/Applications/Pocket Music.app/Contents/Resources/bin/deno"
-            ))
+            parse_content_range("bytes 2097152-3433754/3433755").unwrap(),
+            (2097152, 3433754, 3433755)
         );
-        assert!(parsed.cookies.is_none());
+        assert!(parse_content_range("items 0-1/2").is_err());
     }
 
     #[test]

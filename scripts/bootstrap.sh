@@ -14,8 +14,4 @@ fi
 "$venv_python" -m pip install --upgrade pip
 "$venv_python" -m pip install -r "$project_dir/requirements.txt"
 
-if ! command -v yt-dlp >/dev/null 2>&1; then
-    echo "warning: yt-dlp is not on PATH; install it or set POCKET_YTM_YTDLP" >&2
-fi
-
 echo "Pocket YTM backend is ready. Run: cargo run --release"

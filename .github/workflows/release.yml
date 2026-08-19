@@ -35,7 +35,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements-build-macos.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build-macos.txt
 
       - name: Validate release version
         id: version
@@ -61,7 +63,7 @@ jobs:
       - name: Test
         run: |
           cargo test --all-targets
-          (cd backend && ../.venv/bin/python -m unittest test_ytmusic_bridge.py)
+          (cd backend && ../.venv/bin/python -m unittest test_ytmusic_bridge.py test_yt_dlp_resolver.py)
 
       - name: Build Apple Silicon release
         run: >-
@@ -87,7 +89,7 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 'dist/Pocket Music.app/Contents/Info.plist')" = "${{ steps.version.outputs.version }}"
           lipo "dist/Pocket Music.app/Contents/MacOS/pocket-ytm" -verify_arch arm64
           lipo "dist/Pocket Music.app/Contents/MacOS/pocket-ytm-updater" -verify_arch arm64
-          for dependency in pocket-ytm-bridge ffmpeg ffprobe deno; do
+          for dependency in ffmpeg ffprobe deno; do
             tool="dist/Pocket Music.app/Contents/Resources/bin/$dependency"
             test -x "$tool"
             lipo "$tool" -verify_arch arm64
@@ -96,18 +98,21 @@ jobs:
               exit 1
             fi
           done
-          yt_dlp='dist/Pocket Music.app/Contents/Resources/bin/yt-dlp-runtime/yt-dlp'
-          test -x "$yt_dlp"
-          lipo "$yt_dlp" -verify_arch arm64
-          if find 'dist/Pocket Music.app/Contents/Resources/bin/yt-dlp-runtime' -type f -print0 | xargs -0 file | grep 'x86_64'; then
-            echo 'yt-dlp runtime contains an Intel slice' >&2
-            exit 1
-          fi
-          test "$(PATH=/usr/bin:/bin "$yt_dlp" --version)" = "2026.07.04"
+          for dependency in pocket-ytm-bridge pocket-ytm-resolver; do
+            tool="dist/Pocket Music.app/Contents/Resources/libexec/$dependency/$dependency"
+            test -x "$tool"
+            lipo "$tool" -verify_arch arm64
+            if otool -L "$tool" | tail -n +2 | grep -E '/opt/homebrew|/usr/local|/Users/'; then
+              echo "$dependency is not self-contained" >&2
+              exit 1
+            fi
+          done
           PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/bin/ffmpeg' -version
           PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/bin/deno' --version
-          response=$(printf '%s\n' '{"id":1,"op":"authStatus","params":{}}' | PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/bin/pocket-ytm-bridge' --language ko --location KR --auth "$RUNNER_TEMP/pocket-music-test-auth.json")
+          response=$(printf '%s\n' '{"id":1,"op":"authStatus","params":{}}' | PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/libexec/pocket-ytm-bridge/pocket-ytm-bridge' --language ko --location KR --auth "$RUNNER_TEMP/pocket-music-test-auth.json")
           python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert value["id"] == 1 and value["ok"]' "$response"
+          resolver_response=$(printf '%s\n' '{"id":1,"op":"ping"}' | PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/libexec/pocket-ytm-resolver/pocket-ytm-resolver' --deno 'dist/Pocket Music.app/Contents/Resources/bin/deno')
+          python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert value["id"] == 1 and value["ok"] and value["data"]["version"] == "2026.07.04"' "$resolver_response"
 
       - name: Archive app
         id: archive
