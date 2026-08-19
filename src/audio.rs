@@ -11,7 +11,10 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use parking_lot::RwLock;
-use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
+use rodio::{
+    Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source,
+    cpal::{self, traits::DeviceTrait as _, traits::HostTrait as _},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stream_download::{
@@ -26,6 +29,7 @@ const MEDIA_STREAM_FLAG: &str = "--pocket-music-media-stream";
 const SESSION_CACHE_PREFIX: &str = "pocket-music-session-";
 const STREAM_PREFETCH_BYTES: u64 = 1024 * 128;
 const PREFETCH_START_DELAY: Duration = Duration::from_secs(1);
+const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackPhase {
@@ -87,6 +91,11 @@ struct LoadRequest {
 struct PreparedSource {
     generation: u64,
     result: Result<(NativeSource, Option<Duration>), String>,
+}
+
+struct AudioOutput {
+    _sink: MixerDeviceSink,
+    player: Player,
 }
 
 type NativeSource = Box<dyn Source + Send>;
@@ -167,18 +176,13 @@ fn audio_loop(
     rx: mpsc::Receiver<AudioCommand>,
     snapshot: Arc<RwLock<AudioSnapshot>>,
 ) {
-    let device = match DeviceSinkBuilder::open_default_sink() {
-        Ok(device) => device,
+    let mut output = match open_audio_output(snapshot.read().volume) {
+        Ok(output) => Some(output),
         Err(error) => {
-            set_error(
-                &snapshot,
-                format!("오디오 출력 장치를 열 수 없습니다: {error}"),
-            );
-            return;
+            log::warn!("initial audio output unavailable; playback will retry: {error:#}");
+            None
         }
     };
-    let player = Player::connect_new(device.mixer());
-    player.set_volume(snapshot.read().volume);
 
     let (load_tx, load_rx) = mpsc::channel();
     let (prepared_tx, prepared_rx) = mpsc::channel();
@@ -199,16 +203,44 @@ fn audio_loop(
 
     let mut empty_since = None;
     let mut suppress_empty_until = Instant::now();
+    let mut pending_load: Option<LoadRequest> = None;
+    let mut next_output_retry = Instant::now();
 
     loop {
-        if apply_prepared_sources(&prepared_rx, &player, &snapshot) {
+        if output.is_none() && pending_load.is_some() && Instant::now() >= next_output_retry {
+            match open_audio_output(snapshot.read().volume) {
+                Ok(new_output) => {
+                    output = Some(new_output);
+                    let request = pending_load.take().expect("pending load checked above");
+                    if load_tx.send(request).is_err() {
+                        break;
+                    }
+                    let mut state = snapshot.write();
+                    state.phase = PlaybackPhase::Loading;
+                    state.error = None;
+                }
+                Err(error) => {
+                    set_error(
+                        &snapshot,
+                        format!("오디오 출력 장치를 열 수 없습니다. 다시 시도 중입니다: {error:#}"),
+                    );
+                    next_output_retry = Instant::now() + OUTPUT_RETRY_INTERVAL;
+                }
+            }
+        }
+
+        if let Some(output) = &output
+            && apply_prepared_sources(&prepared_rx, &output.player, &snapshot)
+        {
             empty_since = None;
             suppress_empty_until = Instant::now() + Duration::from_secs(1);
         }
 
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(AudioCommand::Load(item)) => {
-                player.stop();
+                if let Some(output) = &output {
+                    output.player.stop();
+                }
                 empty_since = None;
                 suppress_empty_until = Instant::now() + Duration::from_secs(1);
                 let generation = {
@@ -224,38 +256,51 @@ fn audio_loop(
                     state.error = None;
                     state.generation
                 };
-                let _ = load_tx.send(LoadRequest { generation, item });
+                let request = LoadRequest { generation, item };
+                if output.is_some() {
+                    let _ = load_tx.send(request);
+                    pending_load = None;
+                } else {
+                    pending_load = Some(request);
+                    next_output_retry = Instant::now();
+                }
             }
             Ok(AudioCommand::Prefetch(items)) => {
                 let _ = prefetch_tx.send(items);
             }
             Ok(AudioCommand::Toggle) => {
                 let mut state = snapshot.write();
-                match state.phase {
-                    PlaybackPhase::Playing => {
-                        player.pause();
-                        state.phase = PlaybackPhase::Paused;
+                if let Some(output) = &output {
+                    match state.phase {
+                        PlaybackPhase::Playing => {
+                            output.player.pause();
+                            state.phase = PlaybackPhase::Paused;
+                        }
+                        PlaybackPhase::Paused => {
+                            output.player.play();
+                            state.phase = PlaybackPhase::Playing;
+                        }
+                        _ => {}
                     }
-                    PlaybackPhase::Paused => {
-                        player.play();
-                        state.phase = PlaybackPhase::Playing;
-                    }
-                    _ => {}
                 }
             }
             Ok(AudioCommand::Seek(position)) => {
-                if let Err(error) = player.try_seek(position) {
-                    snapshot.write().error = Some(format!("탐색할 수 없습니다: {error}"));
-                } else {
-                    empty_since = None;
-                    suppress_empty_until = Instant::now() + Duration::from_secs(2);
-                    let mut state = snapshot.write();
-                    state.position = position;
-                    state.error = None;
+                if let Some(output) = &output {
+                    if let Err(error) = output.player.try_seek(position) {
+                        snapshot.write().error = Some(format!("탐색할 수 없습니다: {error}"));
+                    } else {
+                        empty_since = None;
+                        suppress_empty_until = Instant::now() + Duration::from_secs(2);
+                        let mut state = snapshot.write();
+                        state.position = position;
+                        state.error = None;
+                    }
                 }
             }
             Ok(AudioCommand::SetVolume(volume)) => {
-                player.set_volume(volume);
+                if let Some(output) = &output {
+                    output.player.set_volume(volume);
+                }
                 snapshot.write().volume = volume;
                 if let Err(error) = save_volume(&config.settings_path, volume) {
                     log::warn!("볼륨 설정을 저장하지 못했습니다: {error:#}");
@@ -265,41 +310,94 @@ fn audio_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
-        if apply_prepared_sources(&prepared_rx, &player, &snapshot) {
-            empty_since = None;
-            suppress_empty_until = Instant::now() + Duration::from_secs(1);
-        }
-        let mut state = snapshot.write();
-        if matches!(state.phase, PlaybackPhase::Playing | PlaybackPhase::Paused) {
-            state.position = player.get_pos();
-            if player.empty() {
-                let now = Instant::now();
-                if now >= suppress_empty_until {
-                    let since = empty_since.get_or_insert(now);
-                    match classify_empty_source(
-                        now.duration_since(*since),
-                        state.position,
-                        state.duration,
-                    ) {
-                        EmptySource::Wait => {}
-                        EmptySource::Ended => {
-                            state.phase = PlaybackPhase::Ended;
-                            if state.duration.is_zero() {
-                                state.duration = state.position;
+        if let Some(output) = &output {
+            if apply_prepared_sources(&prepared_rx, &output.player, &snapshot) {
+                empty_since = None;
+                suppress_empty_until = Instant::now() + Duration::from_secs(1);
+            }
+            let mut state = snapshot.write();
+            if matches!(state.phase, PlaybackPhase::Playing | PlaybackPhase::Paused) {
+                state.position = output.player.get_pos();
+                if output.player.empty() {
+                    let now = Instant::now();
+                    if now >= suppress_empty_until {
+                        let since = empty_since.get_or_insert(now);
+                        match classify_empty_source(
+                            now.duration_since(*since),
+                            state.position,
+                            state.duration,
+                        ) {
+                            EmptySource::Wait => {}
+                            EmptySource::Ended => {
+                                state.phase = PlaybackPhase::Ended;
+                                if state.duration.is_zero() {
+                                    state.duration = state.position;
+                                }
+                            }
+                            EmptySource::Interrupted => {
+                                state.phase = PlaybackPhase::Error;
+                                state.error =
+                                    Some("오디오 스트림이 곡이 끝나기 전에 중단되었습니다.".into());
                             }
                         }
-                        EmptySource::Interrupted => {
-                            state.phase = PlaybackPhase::Error;
-                            state.error =
-                                Some("오디오 스트림이 곡이 끝나기 전에 중단되었습니다.".into());
-                        }
                     }
+                } else {
+                    empty_since = None;
                 }
-            } else {
-                empty_since = None;
             }
         }
     }
+}
+
+fn open_audio_output(volume: f32) -> Result<AudioOutput> {
+    let host = cpal::default_host();
+    let mut failures = Vec::new();
+
+    if let Some(device) = host.default_output_device() {
+        match open_audio_device(device, volume) {
+            Ok(output) => return Ok(output),
+            Err(error) => failures.push(format!("기본 장치: {error:#}")),
+        }
+    }
+
+    for device in host
+        .output_devices()
+        .context("오디오 출력 장치 목록을 읽지 못했습니다")?
+    {
+        match open_audio_device(device, volume) {
+            Ok(output) => return Ok(output),
+            Err(error) => failures.push(format!("대체 장치: {error:#}")),
+        }
+    }
+
+    if failures.is_empty() {
+        anyhow::bail!("사용 가능한 출력 장치가 없습니다");
+    }
+    anyhow::bail!(failures.join("; "))
+}
+
+fn open_audio_device(device: cpal::Device, volume: f32) -> Result<AudioOutput> {
+    let name = device
+        .description()
+        .map(|description| description.name().to_owned())
+        .unwrap_or_else(|_| "이름 없는 장치".into());
+    // Rodio's convenience opener first requests a fixed buffer size. Some
+    // CoreAudio devices reject that even though their default stream config is
+    // valid, so begin with the OS-selected buffer and then try every supported
+    // configuration for this exact device.
+    let sink = DeviceSinkBuilder::from_device(device)
+        .and_then(|builder| {
+            builder
+                .with_buffer_size(cpal::BufferSize::Default)
+                .open_sink_or_fallback()
+        })
+        .with_context(|| format!("'{name}'을(를) 열지 못했습니다"))?;
+    let player = Player::connect_new(sink.mixer());
+    player.set_volume(volume);
+    Ok(AudioOutput {
+        _sink: sink,
+        player,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

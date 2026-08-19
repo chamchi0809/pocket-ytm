@@ -11,7 +11,6 @@ use crate::{
     CheckForUpdates, FocusSearch, NextTrack, PreviousTrack, TogglePlayback,
     audio::{AudioEngine, AudioSnapshot, PlaybackPhase},
     bridge::YtMusicBridge,
-    image_cache::bounded_image_cache,
     model::{AccountStatus, BrowsePage, Lyrics, MediaItem, MediaSection},
     updater::{AvailableUpdate, UpdateCheck, UpdateClient},
 };
@@ -2576,7 +2575,6 @@ impl PocketYtmApp {
 impl Render for PocketYtmApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .image_cache(bounded_image_cache("pocket-music-artwork", 64))
             .relative()
             .key_context("PocketYtm")
             .on_action(cx.listener(Self::on_toggle_playback))
