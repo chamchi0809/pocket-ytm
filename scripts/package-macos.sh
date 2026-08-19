@@ -32,7 +32,10 @@ for dependency in ffmpeg ffprobe deno; do
     install -m 755 "$dependency_dir/bin/$dependency" "$contents/Resources/bin/$dependency"
 done
 for dependency in pocket-ytm-bridge pocket-ytm-resolver; do
-    ditto \
+    # The v0.1.0-v0.1.2 updater extracts ZIP entries as regular files and does
+    # not recreate symlinks. Dereference PyInstaller's framework links so those
+    # clients can install the bundle without invalidating its code signature.
+    /bin/cp -RL \
         "$dependency_dir/libexec/$dependency" \
         "$contents/Resources/libexec/$dependency"
 done

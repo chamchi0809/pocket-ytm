@@ -1,9 +1,9 @@
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -103,9 +103,7 @@ impl UpdateClient {
 
         let manifest_url = release_asset_url(&release, MANIFEST_ASSET)?;
         let signature_url = release_asset_url(&release, SIGNATURE_ASSET)?;
-        let manifest_bytes = self.download_small(&manifest_url, MAX_MANIFEST_BYTES)?;
-        let signature_bytes = self.download_small(&signature_url, 128)?;
-        let manifest = verify_manifest(&manifest_bytes, &signature_bytes)?;
+        let manifest = self.download_verified_manifest(&manifest_url, &signature_url)?;
 
         ensure!(
             manifest.schema_version == 1,
@@ -162,11 +160,54 @@ impl UpdateClient {
         self.download_and_prepare_macos_install(update)
     }
 
-    fn download_small(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
+    fn download_verified_manifest(
+        &self,
+        manifest_url: &str,
+        signature_url: &str,
+    ) -> Result<UpdateManifest> {
+        let manifest = self.download_small(manifest_url, MAX_MANIFEST_BYTES, false)?;
+        let signature = self.download_small(signature_url, 128, false)?;
+        match verify_manifest(&manifest, &signature) {
+            Ok(value) => Ok(value),
+            Err(first_error) => {
+                log::warn!(
+                    "update signature verification failed; retrying without cache: \
+                     manifest={} bytes sha256={}, signature={} bytes sha256={}: {first_error:#}",
+                    manifest.len(),
+                    sha256_hex(&manifest),
+                    signature.len(),
+                    sha256_hex(&signature),
+                );
+                let manifest = self.download_small(manifest_url, MAX_MANIFEST_BYTES, true)?;
+                let signature = self.download_small(signature_url, 128, true)?;
+                verify_manifest(&manifest, &signature).with_context(|| {
+                    format!(
+                        "업데이트 서명 재검증 실패 (manifest={} bytes sha256={}, \
+                         signature={} bytes sha256={})",
+                        manifest.len(),
+                        sha256_hex(&manifest),
+                        signature.len(),
+                        sha256_hex(&signature),
+                    )
+                })
+            }
+        }
+    }
+
+    fn download_small(&self, url: &str, limit: usize, no_cache: bool) -> Result<Vec<u8>> {
         ensure_github_download_url(url)?;
-        let bytes = self
-            .client
-            .get(url)
+        let request_url = if no_cache {
+            cache_busted_url(url)?
+        } else {
+            url.to_string()
+        };
+        let mut request = self.client.get(&request_url);
+        if no_cache {
+            request = request
+                .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
+                .header(reqwest::header::PRAGMA, "no-cache");
+        }
+        let bytes = request
             .send()
             .with_context(|| format!("업데이트 메타데이터를 내려받지 못했습니다: {url}"))?
             .error_for_status()
@@ -290,6 +331,23 @@ impl UpdateClient {
     }
 }
 
+fn cache_busted_url(url: &str) -> Result<String> {
+    let mut parsed = reqwest::Url::parse(url).context("업데이트 URL이 올바르지 않습니다")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    parsed.query_pairs_mut().append_pair(
+        "pocket-cache-bust",
+        &format!("{}-{nonce}", std::process::id()),
+    );
+    Ok(parsed.into())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn release_asset_url(release: &GitHubRelease, name: &str) -> Result<String> {
     release
         .assets
@@ -381,38 +439,13 @@ fn update_root() -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
-    let archive_file = File::open(archive_path).with_context(|| {
-        format!(
-            "업데이트 압축 파일을 열지 못했습니다: {}",
-            archive_path.display()
-        )
-    })?;
-    let mut archive =
-        zip::ZipArchive::new(archive_file).context("업데이트 ZIP을 읽지 못했습니다")?;
-
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .context("업데이트 ZIP 항목을 읽지 못했습니다")?;
-        let relative = entry
-            .enclosed_name()
-            .ok_or_else(|| anyhow!("업데이트 ZIP에 안전하지 않은 경로가 있습니다"))?;
-        let output_path = destination.join(relative);
-        if entry.is_dir() {
-            fs::create_dir_all(&output_path)?;
-            continue;
-        }
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut output = File::create(&output_path)?;
-        io::copy(&mut entry, &mut output)?;
-        #[cfg(unix)]
-        if let Some(mode) = entry.unix_mode() {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&output_path, fs::Permissions::from_mode(mode))?;
-        }
-    }
+    let status = Command::new("/usr/bin/ditto")
+        .args(["-x", "-k"])
+        .arg(archive_path)
+        .arg(destination)
+        .status()
+        .context("macOS 업데이트 압축 해제 도구를 실행하지 못했습니다")?;
+    ensure!(status.success(), "업데이트 ZIP 압축을 풀지 못했습니다");
     Ok(())
 }
 
@@ -514,5 +547,22 @@ mod tests {
         assert!(validate_sha256(&"a".repeat(64)).is_ok());
         assert!(validate_sha256(&"z".repeat(64)).is_err());
         assert!(validate_sha256(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn cache_busting_preserves_the_release_asset_url() {
+        let url = cache_busted_url(
+            "https://github.com/chamchi0809/pocket-ytm/releases/download/v0.1.3/update-manifest.json",
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("github.com"));
+        assert_eq!(
+            parsed.path(),
+            "/chamchi0809/pocket-ytm/releases/download/v0.1.3/update-manifest.json"
+        );
+        assert!(parsed.query().unwrap().starts_with("pocket-cache-bust="));
     }
 }

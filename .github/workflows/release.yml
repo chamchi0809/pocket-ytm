@@ -10,6 +10,11 @@ on:
         description: Existing v-prefixed tag to release
         required: true
         type: string
+      replace_assets:
+        description: Replace assets of an existing release (repair only)
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -52,6 +57,18 @@ jobs:
           fi
           echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
 
+      - name: Ensure release tag is unpublished
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            if [[ "${{ inputs.replace_assets }}" != "true" ]]; then
+              echo "Release $RELEASE_TAG already exists; published assets are immutable" >&2
+              exit 1
+            fi
+            echo "Repair mode: existing assets will be replaced"
+          fi
+
       - name: Add Apple Silicon Rust target
         run: rustup target add aarch64-apple-darwin
 
@@ -80,6 +97,20 @@ jobs:
           POCKET_YTM_BINARY_DIR: ${{ github.workspace }}/target/aarch64-apple-darwin/release
           POCKET_YTM_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/package-macos.sh
+
+      - name: Flatten bundle links for legacy updater compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          flat_root=$(mktemp -d "$RUNNER_TEMP/pocket-flat-bundle.XXXXXX")
+          /bin/cp -RL "dist/Pocket Music.app" "$flat_root/Pocket Music.app"
+          if find "$flat_root/Pocket Music.app" -type l -print -quit | grep -q .; then
+            echo "Flattened app still contains symbolic links" >&2
+            exit 1
+          fi
+          mv "dist/Pocket Music.app" "$RUNNER_TEMP/Pocket Music.symlinked.app"
+          mv "$flat_root/Pocket Music.app" "dist/Pocket Music.app"
+          codesign --force --deep --sign - "dist/Pocket Music.app"
 
       - name: Verify app bundle
         shell: bash
@@ -161,3 +192,21 @@ jobs:
               --generate-notes \
               --title "Pocket Music $RELEASE_TAG"
           fi
+
+      - name: Verify published update metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          verify_dir=$(mktemp -d "$RUNNER_TEMP/pocket-published-release.XXXXXX")
+          nonce="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          curl --fail --location --retry 5 \
+            --header 'Cache-Control: no-cache, no-store' \
+            "$base/update-manifest.json?pocket-cache-bust=$nonce" \
+            --output "$verify_dir/update-manifest.json"
+          curl --fail --location --retry 5 \
+            --header 'Cache-Control: no-cache, no-store' \
+            "$base/update-manifest.json.sig?pocket-cache-bust=$nonce" \
+            --output "$verify_dir/update-manifest.json.sig"
+          cmp update-manifest.json "$verify_dir/update-manifest.json"
+          cmp update-manifest.json.sig "$verify_dir/update-manifest.json.sig"
