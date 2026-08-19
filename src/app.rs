@@ -376,9 +376,8 @@ impl PocketYtmApp {
         }
         self.auth_busy = true;
         self.quick_login_busy = true;
-        self.auth_message = Some(
-            "Chrome에서 Google 계정에 로그인하세요. 보관함 요청은 앱이 자동으로 감지합니다.".into(),
-        );
+        self.auth_message =
+            Some("Chrome에서 로그인하세요. 완료를 감지하면 앱이 자동으로 연결합니다.".into());
         let backend = self.backend.clone();
         let task = cx.background_spawn(async move { backend.quick_login() });
         cx.spawn(async move |weak, cx| {
@@ -2109,7 +2108,7 @@ impl PocketYtmApp {
                                 .text_size(px(11.))
                                 .line_height(px(17.))
                                 .text_color(rgb(0xa8a8ae))
-                                .child("전용 Chrome 창에서 Google 로그인만 완료하세요. 보관함 요청을 자동으로 감지한 뒤 임시 브라우저 프로필을 삭제합니다."),
+                                .child("자동화 옵션 없는 전용 Chrome 창에서 로그인하세요. 완료를 감지하면 앱이 창을 닫고 로그인 정보를 연결한 뒤 임시 프로필을 삭제합니다."),
                         )
                         .child(
                             div()
@@ -2131,7 +2130,7 @@ impl PocketYtmApp {
                                 .text_color(rgb(0xffffff))
                                 .cursor_pointer()
                                 .child(if self.quick_login_busy {
-                                    loading_indicator("Chrome에서 로그인 기다리는 중")
+                                    loading_indicator("Chrome 로그인 완료를 기다리는 중")
                                 } else {
                                     div().child("Google로 빠르게 로그인").into_any_element()
                                 })

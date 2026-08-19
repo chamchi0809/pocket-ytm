@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture YouTube Music browser authentication from a dedicated Chrome profile."""
+"""Capture YouTube Music auth after a normal, user-driven Chrome login."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -23,7 +24,9 @@ BROWSE_PATH = "/youtubei/v1/browse"
 REQUIRED_HEADERS = {"authorization", "cookie", "x-goog-authuser"}
 START_TIMEOUT_SECONDS = 15
 LOGIN_TIMEOUT_SECONDS = 5 * 60
+CAPTURE_TIMEOUT_SECONDS = 30
 MAX_PENDING_REQUESTS = 128
+LOGIN_COOKIE = "__Secure-3PAPISID"
 
 
 class ChromeLoginError(RuntimeError):
@@ -98,8 +101,7 @@ class BrowseRequestCollector:
                 next(iter(self._headers)),
             )
             self._headers.pop(oldest, None)
-        current = self._headers.setdefault(request_id, {})
-        current.update(raw_headers)
+        self._headers.setdefault(request_id, {}).update(raw_headers)
 
 
 def find_chromium_browser() -> str:
@@ -150,6 +152,30 @@ def find_chromium_browser() -> str:
     )
 
 
+def interactive_login_command(browser: str, profile: Path) -> list[str]:
+    return [
+        browser,
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        MUSIC_LIBRARY_URL,
+    ]
+
+
+def capture_command(browser: str, profile: Path) -> list[str]:
+    return [
+        browser,
+        "--headless=new",
+        "--remote-debugging-port=0",
+        "--remote-allow-origins=http://localhost",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "about:blank",
+    ]
+
+
 def _wait_for_debug_port(
     profile: Path, process: subprocess.Popen[bytes], timeout: float
 ) -> int:
@@ -157,13 +183,13 @@ def _wait_for_debug_port(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise ChromeLoginError("로그인용 브라우저가 시작 직후 종료되었습니다.")
+            raise ChromeLoginError("로그인 확인용 브라우저가 시작 직후 종료되었습니다.")
         try:
             first_line = active_port.read_text(encoding="utf-8").splitlines()[0]
             return int(first_line)
         except (OSError, IndexError, ValueError):
             time.sleep(0.05)
-    raise ChromeLoginError("로그인용 브라우저의 연결 정보를 찾지 못했습니다.")
+    raise ChromeLoginError("로그인 확인용 브라우저의 연결 정보를 찾지 못했습니다.")
 
 
 def _wait_for_page_target(
@@ -173,27 +199,19 @@ def _wait_for_page_target(
     endpoint = f"http://127.0.0.1:{port}/json/list"
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise ChromeLoginError("로그인용 브라우저가 종료되었습니다.")
+            raise ChromeLoginError("로그인 확인용 브라우저가 종료되었습니다.")
         try:
             with urllib.request.urlopen(endpoint, timeout=0.5) as response:
                 targets = json.load(response)
-            pages = [target for target in targets if target.get("type") == "page"]
-            preferred = next(
-                (
-                    page
-                    for page in pages
-                    if str(page.get("url") or "").startswith(
-                        ("https://music.youtube.com", "https://accounts.google.com")
-                    )
-                ),
-                pages[0] if pages else None,
+            page = next(
+                (target for target in targets if target.get("type") == "page"), None
             )
-            if preferred and preferred.get("webSocketDebuggerUrl"):
-                return str(preferred["webSocketDebuggerUrl"])
+            if page and page.get("webSocketDebuggerUrl"):
+                return str(page["webSocketDebuggerUrl"])
         except (OSError, ValueError, json.JSONDecodeError):
             pass
         time.sleep(0.05)
-    raise ChromeLoginError("로그인용 브라우저 탭에 연결하지 못했습니다.")
+    raise ChromeLoginError("로그인 확인용 브라우저 탭에 연결하지 못했습니다.")
 
 
 def _stop_browser(process: subprocess.Popen[bytes]) -> None:
@@ -207,64 +225,125 @@ def _stop_browser(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=5)
 
 
+def has_youtube_login_cookie(profile: Path) -> bool:
+    candidates = (
+        profile / "Default/Network/Cookies",
+        profile / "Default/Cookies",
+    )
+    for database in candidates:
+        if not database.is_file():
+            continue
+        try:
+            connection = sqlite3.connect(
+                f"{database.as_uri()}?mode=ro", uri=True, timeout=0.1
+            )
+            try:
+                found = connection.execute(
+                    "SELECT 1 FROM cookies "
+                    "WHERE name = ? AND (host_key = ? OR host_key LIKE ?) LIMIT 1",
+                    (LOGIN_COOKIE, "youtube.com", "%.youtube.com"),
+                ).fetchone()
+            finally:
+                connection.close()
+            if found:
+                return True
+        except (OSError, sqlite3.Error, ValueError):
+            continue
+    return False
+
+
+def _wait_for_interactive_login(
+    profile: Path, process: subprocess.Popen[bytes], timeout: float
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if has_youtube_login_cookie(profile):
+            # Let Chrome finish the cookie transaction before terminating the
+            # temporary interactive instance and reopening the same profile.
+            time.sleep(0.5)
+            return
+        status = process.poll()
+        if status is not None:
+            if status:
+                raise ChromeLoginError("로그인용 브라우저가 비정상적으로 종료되었습니다.")
+            return
+        time.sleep(0.2)
+    raise ChromeLoginError(
+        "5분 안에 YouTube Music 로그인을 확인하지 못했습니다. 다시 시도해 주세요."
+    )
+
+
+def _capture_from_authenticated_profile(
+    browser: str, profile: Path, timeout: float
+) -> str:
+    process = subprocess.Popen(
+        capture_command(browser, profile),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    connection: websocket.WebSocket | None = None
+    try:
+        port = _wait_for_debug_port(profile, process, START_TIMEOUT_SECONDS)
+        websocket_url = _wait_for_page_target(port, process, START_TIMEOUT_SECONDS)
+        connection = websocket.create_connection(
+            websocket_url,
+            timeout=1,
+            origin="http://localhost",
+        )
+        connection.send(json.dumps({"id": 1, "method": "Network.enable"}))
+        connection.send(
+            json.dumps(
+                {
+                    "id": 2,
+                    "method": "Page.navigate",
+                    "params": {"url": MUSIC_LIBRARY_URL},
+                }
+            )
+        )
+        collector = BrowseRequestCollector()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise ChromeLoginError("로그인 확인용 브라우저가 종료되었습니다.")
+            try:
+                event = json.loads(connection.recv())
+            except websocket.WebSocketTimeoutException:
+                continue
+            except websocket.WebSocketConnectionClosedException as exc:
+                raise ChromeLoginError("로그인 확인용 브라우저 연결이 끊겼습니다.") from exc
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if headers := collector.ingest(event):
+                return headers
+        raise ChromeLoginError(
+            "YouTube Music 로그인 정보를 확인하지 못했습니다. 다시 시도해 주세요."
+        )
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        _stop_browser(process)
+
+
 def capture_browser_auth_headers(timeout: float = LOGIN_TIMEOUT_SECONDS) -> str:
     browser = find_chromium_browser()
     with tempfile.TemporaryDirectory(
         prefix="pocket-music-login-", ignore_cleanup_errors=True
     ) as profile_raw:
         profile = Path(profile_raw)
-        command = [
-            browser,
-            "--remote-debugging-port=0",
-            "--remote-allow-origins=http://localhost",
-            f"--user-data-dir={profile}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--new-window",
-            MUSIC_LIBRARY_URL,
-        ]
-        process = subprocess.Popen(
-            command,
+        interactive = subprocess.Popen(
+            interactive_login_command(browser, profile),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        connection: websocket.WebSocket | None = None
         try:
-            port = _wait_for_debug_port(profile, process, START_TIMEOUT_SECONDS)
-            websocket_url = _wait_for_page_target(port, process, START_TIMEOUT_SECONDS)
-            connection = websocket.create_connection(
-                websocket_url,
-                timeout=1,
-                origin="http://localhost",
-            )
-            connection.send(
-                json.dumps({"id": 1, "method": "Network.enable", "params": {}})
-            )
-            collector = BrowseRequestCollector()
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise ChromeLoginError("로그인용 브라우저가 닫혀 로그인을 취소했습니다.")
-                try:
-                    event = json.loads(connection.recv())
-                except websocket.WebSocketTimeoutException:
-                    continue
-                except websocket.WebSocketConnectionClosedException as exc:
-                    raise ChromeLoginError(
-                        "로그인용 브라우저 탭이 닫혀 로그인을 취소했습니다."
-                    ) from exc
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if headers := collector.ingest(event):
-                    return headers
-            raise ChromeLoginError(
-                "5분 안에 YouTube Music 로그인을 확인하지 못했습니다. 다시 시도해 주세요."
-            )
+            _wait_for_interactive_login(profile, interactive, timeout)
         finally:
-            if connection is not None:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
-            _stop_browser(process)
+            _stop_browser(interactive)
+        return _capture_from_authenticated_profile(
+            browser, profile, CAPTURE_TIMEOUT_SECONDS
+        )
