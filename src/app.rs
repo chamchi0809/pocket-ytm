@@ -65,6 +65,7 @@ pub struct PocketYtmApp {
     auth_loading: bool,
     show_auth: bool,
     auth_busy: bool,
+    quick_login_busy: bool,
     auth_message: Option<String>,
     page: Page,
     sections: Vec<MediaSection>,
@@ -148,6 +149,7 @@ impl PocketYtmApp {
             auth_loading: true,
             show_auth: std::env::var_os("POCKET_YTM_SHOW_LOGIN").is_some(),
             auth_busy: false,
+            quick_login_busy: false,
             auth_message: None,
             page: Page::Home,
             sections: vec![],
@@ -339,6 +341,7 @@ impl PocketYtmApp {
         self.auth_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.auth_busy = true;
+        self.quick_login_busy = false;
         self.auth_message = Some("로그인 정보를 확인하고 있습니다".into());
         let backend = self.backend.clone();
         let task = cx.background_spawn(async move { backend.authenticate(&headers) });
@@ -367,11 +370,49 @@ impl PocketYtmApp {
         cx.notify();
     }
 
+    fn quick_login(&mut self, cx: &mut Context<Self>) {
+        if self.auth_busy {
+            return;
+        }
+        self.auth_busy = true;
+        self.quick_login_busy = true;
+        self.auth_message = Some(
+            "Chrome에서 Google 계정에 로그인하세요. 보관함 요청은 앱이 자동으로 감지합니다.".into(),
+        );
+        let backend = self.backend.clone();
+        let task = cx.background_spawn(async move { backend.quick_login() });
+        cx.spawn(async move |weak, cx| {
+            let result = task.await;
+            if let Some(entity) = weak.upgrade() {
+                entity
+                    .update(cx, |this, cx| {
+                        this.auth_busy = false;
+                        this.quick_login_busy = false;
+                        match result {
+                            Ok(status) => {
+                                this.auth_status = status;
+                                this.auth_message = Some("로그인되었습니다.".into());
+                                this.load_home(cx);
+                            }
+                            Err(error) => {
+                                this.auth_message = Some(format!("빠른 로그인 실패: {error:#}"));
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn logout(&mut self, cx: &mut Context<Self>) {
         if self.auth_busy {
             return;
         }
         self.auth_busy = true;
+        self.quick_login_busy = false;
         self.auth_message = Some("로그아웃하는 중".into());
         let backend = self.backend.clone();
         let task = cx.background_spawn(async move { backend.logout() });
@@ -2048,6 +2089,70 @@ impl PocketYtmApp {
                 .flex()
                 .flex_col()
                 .gap_3()
+                .child(
+                    div()
+                        .p_4()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(0x493039))
+                        .bg(rgb(0x241b1f))
+                        .child(
+                            div()
+                                .text_size(px(15.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(0xf5f5f6))
+                                .child("Chrome 빠른 로그인"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_size(px(11.))
+                                .line_height(px(17.))
+                                .text_color(rgb(0xa8a8ae))
+                                .child("전용 Chrome 창에서 Google 로그인만 완료하세요. 보관함 요청을 자동으로 감지한 뒤 임시 브라우저 프로필을 삭제합니다."),
+                        )
+                        .child(
+                            div()
+                                .id("quick-login")
+                                .mt_3()
+                                .h(px(42.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(if self.auth_busy {
+                                    rgb(0x64303d)
+                                } else {
+                                    rgb(0xff3157)
+                                })
+                                .hover(|style| style.cursor_pointer().bg(rgb(0xff4d6d)))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_size(px(13.))
+                                .text_color(rgb(0xffffff))
+                                .cursor_pointer()
+                                .child(if self.quick_login_busy {
+                                    loading_indicator("Chrome에서 로그인 기다리는 중")
+                                } else {
+                                    div().child("Google로 빠르게 로그인").into_any_element()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.quick_login(cx))),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .py_1()
+                        .child(div().h(px(1.)).flex_1().bg(rgb(0x34343a)))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(0x77777e))
+                                .child("또는 개발자 도구로 직접 연결"),
+                        )
+                        .child(div().h(px(1.)).flex_1().bg(rgb(0x34343a))),
+                )
                 .child(step(
                     "1",
                     "시스템 브라우저에서 YouTube Music에 로그인한 뒤 개발자 도구의 Network 탭을 여세요.",

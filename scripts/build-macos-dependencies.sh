@@ -133,6 +133,9 @@ download \
 download \
     "https://raw.githubusercontent.com/sigma67/ytmusicapi/1.12.2/LICENSE" \
     "$output_dir/licenses/ytmusicapi-LICENSE.txt"
+download \
+    "https://raw.githubusercontent.com/websocket-client/websocket-client/v1.9.0/LICENSE" \
+    "$output_dir/licenses/websocket-client-Apache-2.0.txt"
 
 for binary in \
     "$output_dir/libexec/pocket-ytm-bridge/pocket-ytm-bridge" \
@@ -152,6 +155,7 @@ done
 {
     echo "ytmusicapi=1.12.2"
     echo "yt-dlp=$yt_dlp_version"
+    echo "websocket-client=1.9.0"
     echo "deno=$deno_version"
     echo "ffmpeg=$ffmpeg_version"
     "$python_bin" --version

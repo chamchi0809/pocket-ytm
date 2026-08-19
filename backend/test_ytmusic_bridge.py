@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from ytmusic_bridge import (
     Service,
@@ -111,6 +112,18 @@ class LibraryOrderingTests(unittest.TestCase):
 
 
 class SavedAuthenticationTests(unittest.TestCase):
+    def test_quick_login_reuses_the_normal_authentication_validation(self) -> None:
+        service = Service.__new__(Service)
+        service.authenticate = lambda headers: {"captured": headers}
+
+        with patch(
+            "chrome_login.capture_browser_auth_headers",
+            return_value="cookie: SID=one",
+        ):
+            result = service.dispatch("quickLogin", {})
+
+        self.assertEqual(result, {"captured": "cookie: SID=one"})
+
     def test_cached_account_status_does_not_make_a_network_request(self) -> None:
         class FakeYtMusic:
             def __getattr__(self, _name):

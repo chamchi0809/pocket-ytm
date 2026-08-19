@@ -32,6 +32,8 @@ macOS가 첫 실행을 막으면 Finder에서 앱을 우클릭해 `열기`를 �
 
 로그인 없이도 홈, 둘러보기, 검색, 재생을 사용할 수 있습니다. 보관함과 좋아요를 쓰려면 앱의 로그인 화면에서 계정을 연결하세요.
 
+`Google로 빠르게 로그인`을 누르면 Pocket Music 전용 Chrome 창이 열립니다. Google 로그인을 완료하면 앱이 보관함 요청을 감지해 자동으로 연결하고 임시 Chrome 프로필을 삭제합니다. Chrome, Edge, Brave 또는 Chromium을 찾지 못하면 아래 수동 방식을 사용할 수 있습니다.
+
 1. `music.youtube.com 열기`를 누르고 브라우저에서 로그인합니다.
 2. 개발자 도구를 열고 Network 탭을 선택합니다.
 3. 개발자 도구를 연 상태로 YouTube Music의 `보관함`으로 이동합니다. Network 탭에 `/browse` POST 요청이 생성됩니다.
@@ -85,6 +87,7 @@ git push origin v0.2.0
 | `POCKET_YTM_RESOLVER` | yt-dlp resolver override        |
 | `POCKET_YTM_FFMPEG`   | FFmpeg override                 |
 | `POCKET_YTM_DENO`     | Deno override                   |
+| `POCKET_YTM_BROWSER`  | 빠른 로그인용 Chromium 브라우저 경로 |
 | `POCKET_YTM_LANGUAGE` | YouTube Music 언어, 기본값 `ko` |
 | `POCKET_YTM_LOCATION` | YouTube Music 국가, 기본값 `KR` |
 

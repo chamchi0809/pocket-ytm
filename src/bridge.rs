@@ -66,6 +66,10 @@ impl YtMusicBridge {
         self.mutation("authenticate", json!({"headers": headers}))
     }
 
+    pub fn quick_login(&self) -> Result<AccountStatus> {
+        self.mutation("quickLogin", json!({}))
+    }
+
     pub fn logout(&self) -> Result<AccountStatus> {
         self.mutation("logout", json!({}))
     }

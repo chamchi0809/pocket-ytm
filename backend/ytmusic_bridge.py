@@ -433,6 +433,10 @@ class Service:
     def dispatch(self, op: str, params: dict[str, Any]) -> Any:
         if op in ("ping", "authStatus"):
             return self.account_status()
+        if op == "quickLogin":
+            from chrome_login import capture_browser_auth_headers
+
+            return self.authenticate(capture_browser_auth_headers())
         if op == "authenticate":
             return self.authenticate(text(params.get("headers")))
         if op == "logout":
