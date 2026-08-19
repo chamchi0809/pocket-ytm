@@ -12,6 +12,7 @@ rodio/CPAL을 통해 OS 오디오 장치로 보냅니다. 이 캐시는 앱을 �
 - 앨범·아티스트·플레이리스트 상세 탐색
 - 로그인 사용자의 노래·앨범·아티스트·플레이리스트 보관함
 - 네이티브 백그라운드 재생, 일시정지, seek, 이전/다음, 볼륨
+- 앱 재시작 후에도 복원되는 볼륨 설정
 - 현재 세션의 트랙 캐시와 다음·이전 트랙 백그라운드 prefetch
 - YouTube Music 라디오 큐, 자동 다음 곡, 셔플, 한 곡/전체 반복
 - 가사 패널과 곡 좋아요
@@ -27,16 +28,18 @@ Rust 쪽에 YouTube 응답 형식을 노출할 필요가 없습니다.
 
 ```text
 GPUI native UI
-    ├── ytmusicapi sidecar (stdin/stdout NDJSON) ── 탐색·계정·라이브러리
+    ├── bundled ytmusicapi sidecar (stdin/stdout NDJSON) ── 탐색·계정·라이브러리
     └── native audio thread
-            └── yt-dlp stdout ── FFmpeg PCM/WAV ── session seek cache ── rodio/CPAL ── OS audio
+            └── bundled yt-dlp + Deno ── bundled FFmpeg ── 64KB PCM/WAV chunks
+                    └── session seek cache ── rodio/CPAL ── OS audio
 ```
 
 `gpui-component`의 WebView feature를 비활성화했고 `wry`/Chromium은 의존성에 포함되지 않습니다.
 
 ## 빠른 시작
 
-필수 도구는 최신 stable Rust, Python 3.10+, `yt-dlp`, FFmpeg입니다.
+소스에서 개발할 때 필요한 도구는 최신 stable Rust와 Python 3.10+입니다. 시스템 `yt-dlp`와
+FFmpeg는 개발 실행의 fallback으로 사용할 수 있습니다.
 
 ```sh
 ./scripts/bootstrap.sh
@@ -49,8 +52,9 @@ macOS `.app` 번들은 다음 명령으로 만듭니다. 결과물은 `dist/Pock
 ./scripts/package-macos.sh
 ```
 
-패키징 스크립트는 Cargo의 앱 버전을 `Info.plist`에 주입하고 업데이트 전용 helper도 번들에
-포함합니다. 새 버전은 기존 `.app`만 원자적으로 교체하므로
+패키징 스크립트는 Apple Silicon용 ytmusicapi/Python 브리지, 공식 yt-dlp standalone, Deno,
+외부 라이브러리 없이 빌드한 FFmpeg/ffprobe와 업데이트 helper를 모두 `.app` 안에 포함합니다.
+설치 사용자는 Python이나 Homebrew를 설치할 필요가 없습니다. 새 버전은 기존 `.app`만 원자적으로 교체하므로
 `~/Library/Application Support/Pocket Music`의 로그인·쿠키 데이터는 유지됩니다.
 
 ## 자동 업데이트와 릴리스
@@ -77,12 +81,6 @@ git push origin main v0.2.0
 manifest 개인키 seed는 저장소 파일이 아니라 `UPDATE_SIGNING_KEY_BASE64` Actions secret으로만 관리합니다.
 macOS 앱 자체는 현재 ad-hoc 코드 서명됩니다. 다른 Mac에 경고 없는 공개 배포를 하려면 Developer ID
 Application 서명과 Apple notarization 단계를 추가로 구성해야 합니다.
-
-macOS에서는 Homebrew로 미디어 도구를 설치할 수 있습니다.
-
-```sh
-brew install yt-dlp ffmpeg
-```
 
 이 프로젝트는 macOS에서 전체 Xcode 없이도 빌드할 수 있도록 GPUI의 `macos-blade` 렌더러를 켭니다.
 표준 GPUI Metal 렌더러로 되돌릴 경우 전체 Xcode를 설치하고 아래처럼 developer directory를 선택해야
@@ -127,10 +125,13 @@ Rust MSVC toolchain과 WebView가 아닌 네이티브 GPUI/CPAL 경로를 사용
 
 | 변수 | 기본값 | 용도 |
 |---|---|---|
-| `POCKET_YTM_PYTHON` | `.venv` 또는 `python3` | Python 실행 파일 |
+| `POCKET_YTM_PYTHON` | `.venv` 또는 `python3` | 소스 실행용 Python fallback |
+| `POCKET_YTM_BRIDGE` | 앱 내장 브리지 | ytmusicapi 실행 파일 또는 Python 스크립트 |
 | `POCKET_YTM_AUTH` | 사용자 설정 폴더의 `auth.json` | ytmusicapi browser 인증 |
-| `POCKET_YTM_YTDLP` | `yt-dlp` | yt-dlp 실행 파일 |
-| `POCKET_YTM_FFMPEG` | `ffmpeg` | 오디오 정규화용 FFmpeg 실행 파일 |
+| `POCKET_YTM_SETTINGS` | 인증 파일 옆 `settings.json` | 볼륨 등 영속 설정 |
+| `POCKET_YTM_YTDLP` | 앱 내장 `yt-dlp` | yt-dlp 실행 파일 override |
+| `POCKET_YTM_FFMPEG` | 앱 내장 `ffmpeg` | 오디오 정규화용 FFmpeg override |
+| `POCKET_YTM_DENO` | 앱 내장 `deno` | yt-dlp YouTube JS challenge runtime override |
 | `POCKET_YTM_COOKIES` | 인증 파일 옆 `cookies.txt` | 재생용 쿠키 |
 | `POCKET_YTM_LANGUAGE` | `ko` | YouTube Music 언어 |
 | `POCKET_YTM_LOCATION` | `KR` | YouTube Music 국가 |
@@ -151,6 +152,8 @@ Rust MSVC toolchain과 WebView가 아닌 네이티브 GPUI/CPAL 경로를 사용
 cargo fmt --all -- --check
 cargo test
 (cd backend && ../.venv/bin/python -m unittest test_ytmusic_bridge.py)
+./scripts/build-macos-dependencies.sh
+./scripts/package-macos.sh
 ```
 
 ## 현실적인 호환성 경계

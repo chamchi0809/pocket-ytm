@@ -12,6 +12,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use parking_lot::RwLock;
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stream_download::{
     Settings, StreamDownload,
@@ -23,7 +24,8 @@ use crate::{config::AppConfig, model::MediaItem};
 
 const MEDIA_STREAM_FLAG: &str = "--pocket-music-media-stream";
 const SESSION_CACHE_PREFIX: &str = "pocket-music-session-";
-const STREAM_PREFETCH_BYTES: u64 = 1024 * 512;
+const STREAM_PREFETCH_BYTES: u64 = 1024 * 128;
+const PREFETCH_START_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackPhase {
@@ -99,7 +101,11 @@ impl AudioEngine {
                 .expect("failed to create session audio cache"),
         );
         let (tx, rx) = mpsc::channel();
-        let snapshot = Arc::new(RwLock::new(AudioSnapshot::default()));
+        let initial_snapshot = AudioSnapshot {
+            volume: load_saved_volume(&config.settings_path).unwrap_or(0.8),
+            ..Default::default()
+        };
+        let snapshot = Arc::new(RwLock::new(initial_snapshot));
         let thread_snapshot = snapshot.clone();
         let thread_cache = session_cache.clone();
         thread::Builder::new()
@@ -184,10 +190,11 @@ fn audio_loop(
         .expect("failed to start source loader");
 
     let (prefetch_tx, prefetch_rx) = mpsc::channel();
+    let prefetch_config = config.clone();
     let prefetch_cache = session_cache.clone();
     thread::Builder::new()
         .name("pocket-ytm-prefetch".into())
-        .spawn(move || prefetch_loop(config, prefetch_cache, prefetch_rx))
+        .spawn(move || prefetch_loop(prefetch_config, prefetch_cache, prefetch_rx))
         .expect("failed to start source prefetcher");
 
     let mut empty_since = None;
@@ -250,6 +257,9 @@ fn audio_loop(
             Ok(AudioCommand::SetVolume(volume)) => {
                 player.set_volume(volume);
                 snapshot.write().volume = volume;
+                if let Err(error) = save_volume(&config.settings_path, volume) {
+                    log::warn!("볼륨 설정을 저장하지 못했습니다: {error:#}");
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -401,6 +411,35 @@ fn prefetch_loop(
     'requests: loop {
         while let Ok(newer) = rx.try_recv() {
             targets = newer;
+        }
+        // Starting a second yt-dlp + FFmpeg pair while the current track is
+        // still filling its .part file roughly doubles the process working set.
+        // Wait for that initial stream to finish, while still reacting instantly
+        // if the queue changes.
+        let wait_started = Instant::now();
+        loop {
+            let active_download = std::fs::read_dir(session_cache.path())
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "part")
+                });
+            if wait_started.elapsed() >= PREFETCH_START_DELAY && !active_download {
+                break;
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(newer) => {
+                    targets = newer;
+                    continue 'requests;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
         for item in &targets {
             let Some(url) = item.watch_url() else {
@@ -590,6 +629,9 @@ fn media_helper_command(
         .arg(cache_path)
         .arg("--duration")
         .arg(duration_path);
+    if let Some(deno) = &config.deno {
+        command.arg("--deno").arg(deno);
+    }
     if let Some(cookies) = &config.cookies_path
         && cookies.exists()
     {
@@ -625,8 +667,17 @@ fn media_stream_main(args: impl Iterator<Item = OsString>) -> Result<()> {
     let mut yt_dlp = StdCommand::new(&args.yt_dlp);
     yt_dlp
         .arg(&args.url)
-        .args(["--quiet", "--no-part", "--no-continue", "--no-playlist"])
+        .args([
+            "--quiet",
+            "--ignore-config",
+            "--no-update",
+            "--no-part",
+            "--no-continue",
+            "--no-playlist",
+        ])
         .args(["-f", &args.format, "-o", "-"])
+        .arg("--ffmpeg-location")
+        .arg(&args.ffmpeg)
         .arg("--print-to-file")
         .arg("before_dl:%(duration)s")
         .arg(&duration_part)
@@ -634,6 +685,11 @@ fn media_stream_main(args: impl Iterator<Item = OsString>) -> Result<()> {
         .stderr(Stdio::inherit());
     if let Some(cookies) = &args.cookies {
         yt_dlp.arg("--cookies").arg(cookies);
+    }
+    if let Some(deno) = &args.deno {
+        yt_dlp
+            .arg("--js-runtimes")
+            .arg(format!("deno:{}", deno.display()));
     }
     let mut yt_dlp = yt_dlp
         .spawn()
@@ -740,6 +796,7 @@ fn media_stream_main(args: impl Iterator<Item = OsString>) -> Result<()> {
 struct MediaArgs {
     yt_dlp: String,
     ffmpeg: String,
+    deno: Option<PathBuf>,
     url: String,
     format: String,
     cache: PathBuf,
@@ -765,6 +822,7 @@ fn parse_media_args(mut args: impl Iterator<Item = OsString>) -> Result<MediaArg
     Ok(MediaArgs {
         yt_dlp: required("--yt-dlp")?.to_string_lossy().into_owned(),
         ffmpeg: required("--ffmpeg")?.to_string_lossy().into_owned(),
+        deno: values.get("--deno").map(PathBuf::from),
         url: required("--url")?.to_string_lossy().into_owned(),
         format: required("--format")?.to_string_lossy().into_owned(),
         cache: PathBuf::from(required("--cache")?),
@@ -795,6 +853,33 @@ fn set_error(snapshot: &RwLock<AudioSnapshot>, error: String) {
     let mut state = snapshot.write();
     state.phase = PlaybackPhase::Error;
     state.error = Some(error);
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistentAudioSettings {
+    volume: f32,
+}
+
+fn load_saved_volume(path: &Path) -> Option<f32> {
+    let settings: PersistentAudioSettings =
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    settings
+        .volume
+        .is_finite()
+        .then(|| settings.volume.clamp(0.0, 1.0))
+}
+
+fn save_volume(path: &Path, volume: f32) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("설정 폴더를 만들지 못했습니다")?;
+    }
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(&PersistentAudioSettings {
+        volume: volume.clamp(0.0, 1.0),
+    })?;
+    std::fs::write(&temporary, bytes).context("임시 설정 파일을 쓰지 못했습니다")?;
+    std::fs::rename(&temporary, path).context("볼륨 설정을 확정하지 못했습니다")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -831,6 +916,8 @@ mod tests {
             "yt-dlp",
             "--ffmpeg",
             "ffmpeg",
+            "--deno",
+            "/Applications/Pocket Music.app/Contents/Resources/bin/deno",
             "--url",
             "https://music.youtube.com/watch?v=abc",
             "--format",
@@ -845,7 +932,34 @@ mod tests {
         let parsed = parse_media_args(args).unwrap();
         assert_eq!(parsed.cache, Path::new("/tmp/cache.wav"));
         assert_eq!(parsed.duration, Path::new("/tmp/cache.duration"));
+        assert_eq!(
+            parsed.deno.as_deref(),
+            Some(Path::new(
+                "/Applications/Pocket Music.app/Contents/Resources/bin/deno"
+            ))
+        );
         assert!(parsed.cookies.is_none());
+    }
+
+    #[test]
+    fn volume_round_trips_through_persistent_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = root.path().join("nested/settings.json");
+
+        save_volume(&settings, 0.35).unwrap();
+
+        assert_eq!(load_saved_volume(&settings), Some(0.35));
+    }
+
+    #[test]
+    fn persisted_volume_is_clamped_and_invalid_json_is_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = root.path().join("settings.json");
+        save_volume(&settings, 2.0).unwrap();
+        assert_eq!(load_saved_volume(&settings), Some(1.0));
+
+        std::fs::write(&settings, b"not json").unwrap();
+        assert_eq!(load_saved_volume(&settings), None);
     }
 
     #[test]

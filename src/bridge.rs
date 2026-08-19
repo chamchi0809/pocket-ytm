@@ -20,7 +20,7 @@ use crate::{
 
 pub struct YtMusicBridge {
     config: AppConfig,
-    script: PathBuf,
+    entrypoint: PathBuf,
     process: Mutex<Option<Sidecar>>,
     next_id: AtomicU64,
 }
@@ -45,7 +45,7 @@ impl YtMusicBridge {
     pub fn new(config: AppConfig) -> Arc<Self> {
         Arc::new(Self {
             config,
-            script: bridge_script_path(),
+            entrypoint: bridge_entrypoint_path(),
             process: Mutex::new(None),
             next_id: AtomicU64::new(1),
         })
@@ -146,14 +146,22 @@ impl YtMusicBridge {
     }
 
     fn spawn(&self) -> Result<Sidecar> {
-        if !self.script.exists() {
-            bail!("Python bridge not found: {}", self.script.display());
+        if !self.entrypoint.exists() {
+            bail!("ytmusicapi bridge not found: {}", self.entrypoint.display());
         }
 
-        let mut command = Command::new(&self.config.python);
+        let is_python_script = self
+            .entrypoint
+            .extension()
+            .is_some_and(|value| value == "py");
+        let mut command = if is_python_script {
+            let mut command = Command::new(&self.config.python);
+            command.arg("-u").arg(&self.entrypoint);
+            command
+        } else {
+            Command::new(&self.entrypoint)
+        };
         command
-            .arg("-u")
-            .arg(&self.script)
             .arg("--language")
             .arg(&self.config.language)
             .arg("--location")
@@ -165,8 +173,8 @@ impl YtMusicBridge {
 
         let mut child = command.spawn().with_context(|| {
             format!(
-                "Python 실행 파일 '{}'을(를) 시작할 수 없습니다",
-                self.config.python
+                "ytmusicapi 브리지 '{}'을(를) 시작할 수 없습니다",
+                self.entrypoint.display()
             )
         })?;
         let stdin = child.stdin.take().context("sidecar stdin unavailable")?;
@@ -179,19 +187,12 @@ impl YtMusicBridge {
     }
 }
 
-fn bridge_script_path() -> PathBuf {
+fn bridge_entrypoint_path() -> PathBuf {
     if let Some(path) = std::env::var_os("POCKET_YTM_BRIDGE") {
         return PathBuf::from(path);
     }
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(macos_dir) = executable.parent()
-    {
-        let bundled = macos_dir
-            .parent()
-            .map(|contents| contents.join("Resources/backend/ytmusic_bridge.py"));
-        if let Some(path) = bundled.filter(|path| path.exists()) {
-            return path;
-        }
+    if let Some(path) = crate::config::bundled_tool_path("pocket-ytm-bridge") {
+        return path;
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("backend")

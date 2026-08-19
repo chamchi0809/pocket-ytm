@@ -3,6 +3,7 @@ mod audio;
 mod bridge;
 mod config;
 mod http_client;
+mod image_cache;
 mod model;
 mod updater;
 

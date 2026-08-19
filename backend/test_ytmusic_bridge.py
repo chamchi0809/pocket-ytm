@@ -1,6 +1,6 @@
 import unittest
 
-from ytmusic_bridge import Service, normalize_auth_input, normalize_item
+from ytmusic_bridge import Service, normalize_auth_input, normalize_item, thumbnail
 
 
 class NormalizeAuthInputTests(unittest.TestCase):
@@ -34,6 +34,19 @@ class NormalizeAuthInputTests(unittest.TestCase):
 
 
 class NormalizeMediaItemTests(unittest.TestCase):
+    def test_thumbnail_avoids_oversized_texture_candidates(self) -> None:
+        value = thumbnail(
+            {
+                "thumbnails": [
+                    {"url": "small", "width": 120, "height": 120},
+                    {"url": "right-sized", "width": 400, "height": 400},
+                    {"url": "oversized", "width": 1200, "height": 1200},
+                ]
+            }
+        )
+
+        self.assertEqual(value, "right-sized")
+
     def test_explore_album_watch_playlist_is_routed_to_album_browse(self) -> None:
         item = normalize_item(
             {

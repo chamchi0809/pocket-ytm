@@ -121,7 +121,16 @@ def thumbnail(raw: Any) -> str | None:
     candidates = [item for item in thumbnails if isinstance(item, dict) and item.get("url")]
     if not candidates:
         return None
-    return max(candidates, key=lambda item: item.get("width", 0) * item.get("height", 0))["url"]
+    # The largest candidate is often far larger than any artwork view and stays
+    # resident as a decoded texture. Keep enough pixels for a Retina 190 pt card
+    # while avoiding multi-megapixel thumbnails.
+    candidates.sort(key=lambda item: item.get("width", 0) * item.get("height", 0))
+    suitable = [
+        item
+        for item in candidates
+        if item.get("width", 0) >= 384 and item.get("height", 0) >= 384
+    ]
+    return (suitable[0] if suitable else candidates[-1])["url"]
 
 
 def names(values: Any) -> list[str]:
