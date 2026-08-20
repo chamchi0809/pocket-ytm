@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod bridge;
 mod config;
+mod e2e;
 mod http_client;
 mod model;
 mod resolver;
@@ -69,7 +70,7 @@ fn main() {
                 Err(error) => log::warn!("remote artwork client unavailable: {error:#}"),
             }
 
-            let mut bindings = vec![KeyBinding::new("space", TogglePlayback, Some("PocketYtm"))];
+            let mut bindings = Vec::new();
             if cfg!(target_os = "macos") {
                 bindings.extend([
                     KeyBinding::new("cmd-right", NextTrack, Some("PocketYtm")),

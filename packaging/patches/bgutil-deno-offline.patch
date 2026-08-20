@@ -1,0 +1,13 @@
+diff --git a/plugin/yt_dlp_plugins/extractor/getpot_bgutil_script.py b/plugin/yt_dlp_plugins/extractor/getpot_bgutil_script.py
+index eb5232f..0766350 100644
+--- a/plugin/yt_dlp_plugins/extractor/getpot_bgutil_script.py
++++ b/plugin/yt_dlp_plugins/extractor/getpot_bgutil_script.py
+@@ -309,7 +309,8 @@ class BgUtilScriptDenoPTP(BgUtilScriptPTPBase):
+         node_mods_path = os.path.join(self._server_home, 'node_modules')
+         return (
+-            'run', '--allow-env', '--allow-net',
++            'run', '--node-modules-dir=manual', '--no-lock',
++            '--allow-env', '--allow-net',
+             f'--allow-ffi={escpath(node_mods_path)}',
+             f'--allow-write={escpath(self._script_cache_dir)}',
+             f'--allow-read={escpath(self._script_cache_dir, node_mods_path)}',

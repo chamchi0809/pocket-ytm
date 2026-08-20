@@ -1,9 +1,13 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use gpui::{
-    AnyElement, Context, Entity, Focusable as _, IntoElement, MouseButton, MouseMoveEvent,
-    ObjectFit, Render, SharedString, StyledImage as _, Task, Timer, Window, div, image_cache, img,
-    prelude::*, px, relative, retain_all, rgb, rgba,
+    AnyElement, Context, Entity, Focusable as _, IntoElement, KeyDownEvent, MouseButton,
+    MouseMoveEvent, ObjectFit, Render, SharedString, StyledImage as _, Task, Timer, Window, div,
+    image_cache, img, prelude::*, px, relative, retain_all, rgb, rgba,
 };
 use gpui_component::{
     Sizable as _,
@@ -15,6 +19,7 @@ use crate::{
     CheckForUpdates, FocusSearch, NextTrack, PreviousTrack, TogglePlayback,
     audio::{AudioEngine, AudioSnapshot, PlaybackPhase},
     bridge::YtMusicBridge,
+    e2e::{self, E2eCommand, E2eHarness, E2eRequest},
     model::{AccountStatus, BrowsePage, Lyrics, MediaItem, MediaSection},
     updater::{AvailableUpdate, UpdateCheck, UpdateClient},
 };
@@ -72,6 +77,7 @@ pub struct PocketYtmApp {
     search_results: Vec<MediaItem>,
     search_query: String,
     detail: Option<BrowsePage>,
+    detail_source: Option<MediaItem>,
     loading: bool,
     content_image_generation: u64,
     error: Option<String>,
@@ -85,7 +91,7 @@ pub struct PocketYtmApp {
     lyrics: Option<Lyrics>,
     shuffle: bool,
     repeat: RepeatMode,
-    liked: HashSet<String>,
+    like_overrides: HashMap<String, bool>,
     audio_snapshot: AudioSnapshot,
     seek_drag_fraction: Option<f64>,
     last_ended_generation: Option<u64>,
@@ -93,6 +99,7 @@ pub struct PocketYtmApp {
     updater: Option<UpdateClient>,
     update_state: UpdateState,
     show_update: bool,
+    e2e: Option<E2eHarness>,
     _poll_task: Task<()>,
 }
 
@@ -131,6 +138,7 @@ impl PocketYtmApp {
                 if entity
                     .update(cx, |this, cx| {
                         this.update_audio(snapshot, cx);
+                        this.process_e2e_requests(cx);
                     })
                     .is_err()
                 {
@@ -156,6 +164,7 @@ impl PocketYtmApp {
             search_results: vec![],
             search_query: String::new(),
             detail: None,
+            detail_source: None,
             loading: false,
             content_image_generation: 0,
             error: None,
@@ -169,7 +178,7 @@ impl PocketYtmApp {
             lyrics: None,
             shuffle: false,
             repeat: RepeatMode::Off,
-            liked: HashSet::new(),
+            like_overrides: HashMap::new(),
             seek_drag_fraction: None,
             last_ended_generation: None,
             watch_queue_request: 0,
@@ -181,8 +190,292 @@ impl PocketYtmApp {
                 .ok(),
             update_state: UpdateState::Idle,
             show_update: false,
+            e2e: E2eHarness::from_env(),
             _poll_task: poll_task,
         }
+    }
+
+    fn process_e2e_requests(&mut self, cx: &mut Context<Self>) {
+        let requests = self.e2e.as_ref().map(E2eHarness::drain).unwrap_or_default();
+        for request in requests {
+            let E2eRequest {
+                command,
+                response: response_tx,
+            } = request;
+            let quit = matches!(command, E2eCommand::Quit);
+            let response = match command {
+                E2eCommand::GetState => e2e::ok(self.e2e_state()),
+                E2eCommand::Search { query } => {
+                    if query.trim().is_empty() {
+                        e2e::error("검색어가 비어 있습니다.")
+                    } else {
+                        self.search(query, cx);
+                        e2e::ok(serde_json::json!({"accepted": true}))
+                    }
+                }
+                E2eCommand::OpenSectionItem { section, index } => {
+                    match self.section_item(section, index) {
+                        Some(item) if item.browsable() => {
+                            self.browse(item, cx);
+                            e2e::ok(serde_json::json!({
+                                "accepted": true,
+                                "section": section,
+                                "index": index,
+                            }))
+                        }
+                        Some(_) => e2e::error(format!(
+                            "콘텐츠 섹션 {section}의 {index}번 항목에는 열 수 있는 상세 정보가 없습니다."
+                        )),
+                        None => e2e::error(format!(
+                            "콘텐츠 섹션 {section}의 {index}번 항목이 없습니다."
+                        )),
+                    }
+                }
+                E2eCommand::PlaySectionItem { section, index } => {
+                    let queue = self
+                        .sections
+                        .get(section)
+                        .map(|section| section.items.clone());
+                    match queue
+                        .and_then(|queue| queue.get(index).cloned().map(|item| (item, queue)))
+                    {
+                        Some((item, _))
+                            if matches!(item.kind.as_str(), "playlist" | "album" | "single") =>
+                        {
+                            self.play_collection(item, cx);
+                            e2e::ok(serde_json::json!({
+                                "accepted": true,
+                                "section": section,
+                                "index": index,
+                            }))
+                        }
+                        Some((item, queue)) => {
+                            self.play_item(item, queue, cx);
+                            e2e::ok(serde_json::json!({
+                                "accepted": true,
+                                "section": section,
+                                "index": index,
+                            }))
+                        }
+                        None => e2e::error(format!(
+                            "콘텐츠 섹션 {section}의 {index}번 항목이 없습니다."
+                        )),
+                    }
+                }
+                E2eCommand::OpenSearchResult { index } => {
+                    match self.search_results.get(index).cloned() {
+                        Some(item) if item.browsable() => {
+                            self.browse(item, cx);
+                            e2e::ok(serde_json::json!({"accepted": true, "index": index}))
+                        }
+                        Some(_) => e2e::error(format!(
+                            "검색 결과 {index}번 항목에는 열 수 있는 상세 정보가 없습니다."
+                        )),
+                        None => e2e::error(format!("검색 결과 {index}번 항목이 없습니다.")),
+                    }
+                }
+                E2eCommand::PlaySearchResult { index } => {
+                    if let Some(item) = self.search_results.get(index).cloned() {
+                        if matches!(item.kind.as_str(), "playlist" | "album" | "single") {
+                            self.play_collection(item, cx);
+                        } else {
+                            self.play_item(item, self.search_results.clone(), cx);
+                        }
+                        e2e::ok(serde_json::json!({"accepted": true, "index": index}))
+                    } else {
+                        e2e::error(format!("검색 결과 {index}번 항목이 없습니다."))
+                    }
+                }
+                E2eCommand::OpenDetailItem { section, index } => {
+                    match self.detail_item(section, index) {
+                        Some(item) if item.browsable() => {
+                            self.browse(item, cx);
+                            e2e::ok(serde_json::json!({
+                                "accepted": true,
+                                "section": section,
+                                "index": index,
+                            }))
+                        }
+                        Some(_) => e2e::error(format!(
+                            "상세 섹션 {section}의 {index}번 항목에는 열 수 있는 상세 정보가 없습니다."
+                        )),
+                        None => {
+                            e2e::error(format!("상세 섹션 {section}의 {index}번 항목이 없습니다."))
+                        }
+                    }
+                }
+                E2eCommand::PlayDetailItem { section, index } => {
+                    let queue = self
+                        .detail
+                        .as_ref()
+                        .and_then(|detail| detail.sections.get(section))
+                        .map(|section| section.items.clone());
+                    match queue
+                        .and_then(|queue| queue.get(index).cloned().map(|item| (item, queue)))
+                    {
+                        Some((item, _))
+                            if matches!(item.kind.as_str(), "playlist" | "album" | "single") =>
+                        {
+                            self.play_collection(item, cx);
+                            e2e::ok(serde_json::json!({
+                                "accepted": true,
+                                "section": section,
+                                "index": index,
+                            }))
+                        }
+                        Some((item, queue)) => {
+                            self.play_item(item, queue, cx);
+                            e2e::ok(serde_json::json!({
+                                "accepted": true,
+                                "section": section,
+                                "index": index,
+                            }))
+                        }
+                        None => {
+                            e2e::error(format!("상세 섹션 {section}의 {index}번 항목이 없습니다."))
+                        }
+                    }
+                }
+                E2eCommand::Seek { seconds } => {
+                    if !seconds.is_finite() || seconds < 0.0 {
+                        e2e::error("탐색 위치는 0 이상의 유한한 초 단위 값이어야 합니다.")
+                    } else if self.audio_snapshot.item.is_none() {
+                        e2e::error("현재 재생 항목이 없습니다.")
+                    } else {
+                        self.audio.seek(Duration::from_secs_f64(seconds));
+                        e2e::ok(serde_json::json!({"accepted": true, "seconds": seconds}))
+                    }
+                }
+                E2eCommand::TogglePlayback => {
+                    self.toggle_playback();
+                    e2e::ok(serde_json::json!({"accepted": true}))
+                }
+                E2eCommand::NextTrack => {
+                    self.next();
+                    e2e::ok(serde_json::json!({"accepted": true}))
+                }
+                E2eCommand::PreviousTrack => {
+                    self.previous();
+                    e2e::ok(serde_json::json!({"accepted": true}))
+                }
+                E2eCommand::Quit => e2e::ok(serde_json::json!({"accepted": true})),
+            };
+            let _ = response_tx.send(response);
+            if quit {
+                cx.quit();
+                break;
+            }
+        }
+    }
+
+    fn e2e_state(&self) -> serde_json::Value {
+        let phase = match self.audio_snapshot.phase {
+            PlaybackPhase::Idle => "idle",
+            PlaybackPhase::Loading => "loading",
+            PlaybackPhase::Playing => "playing",
+            PlaybackPhase::Paused => "paused",
+            PlaybackPhase::Ended => "ended",
+            PlaybackPhase::Error => "error",
+        };
+        let page = match self.page {
+            Page::Home => "home",
+            Page::Explore => "explore",
+            Page::Library => "library",
+            Page::Search => "search",
+            Page::Detail => "detail",
+        };
+        serde_json::json!({
+            "page": page,
+            "loading": self.loading,
+            "error": self.error,
+            "authenticated": self.auth_status.authenticated,
+            "searchQuery": self.search_query,
+            "searchResults": self.search_results.iter().enumerate().map(|(index, item)| {
+                Self::e2e_item(index, item)
+            }).collect::<Vec<_>>(),
+            "sections": self.sections.iter().enumerate().map(|(section_index, section)| {
+                serde_json::json!({
+                    "index": section_index,
+                    "title": section.title,
+                    "subtitle": section.subtitle,
+                    "items": section.items.iter().enumerate().map(|(index, item)| {
+                        Self::e2e_item(index, item)
+                    }).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>(),
+            "detail": self.detail.as_ref().map(|detail| serde_json::json!({
+                "title": detail.title,
+                "subtitle": detail.subtitle,
+                "sections": detail.sections.iter().enumerate().map(|(section_index, section)| {
+                    serde_json::json!({
+                        "index": section_index,
+                        "title": section.title,
+                        "items": section.items.iter().enumerate().map(|(index, item)| {
+                            Self::e2e_item(index, item)
+                        }).collect::<Vec<_>>(),
+                    })
+                }).collect::<Vec<_>>(),
+            })),
+            "queueIndex": self.queue_index,
+            "queue": self.queue.iter().enumerate().map(|(index, item)| {
+                Self::e2e_item(index, item)
+            }).collect::<Vec<_>>(),
+            "audio": {
+                "phase": phase,
+                "item": self.audio_snapshot.item.as_ref().map(|item| serde_json::json!({
+                    "title": item.title,
+                    "subtitle": item.subtitle,
+                    "videoId": item.video_id,
+                })),
+                "positionSeconds": self.audio_snapshot.position.as_secs_f64(),
+                "durationSeconds": self.audio_snapshot.duration.as_secs_f64(),
+                "bufferedRanges": self.audio_snapshot.buffered_ranges.iter().map(|range| {
+                    serde_json::json!({
+                        "startSeconds": range.start.as_secs_f64(),
+                        "endSeconds": range.end.as_secs_f64(),
+                    })
+                }).collect::<Vec<_>>(),
+                "replacement": self.audio_snapshot.replacement.as_ref().map(|replacement| {
+                    serde_json::json!({
+                        "title": replacement.title,
+                        "videoId": replacement.video_id,
+                    })
+                }),
+                "error": self.audio_snapshot.error,
+                "generation": self.audio_snapshot.generation,
+            },
+        })
+    }
+
+    fn detail_item(&self, section: usize, index: usize) -> Option<MediaItem> {
+        self.detail
+            .as_ref()?
+            .sections
+            .get(section)?
+            .items
+            .get(index)
+            .cloned()
+    }
+
+    fn section_item(&self, section: usize, index: usize) -> Option<MediaItem> {
+        self.sections.get(section)?.items.get(index).cloned()
+    }
+
+    fn e2e_item(index: usize, item: &MediaItem) -> serde_json::Value {
+        serde_json::json!({
+            "index": index,
+            "title": item.title,
+            "subtitle": item.subtitle,
+            "kind": item.kind,
+            "videoId": item.video_id,
+            "browseId": item.browse_id,
+            "playlistId": item.playlist_id,
+            "sourcePlaylistId": item.source_playlist_id,
+            "sourceIndex": item.source_index,
+            "playable": item.playable(),
+            "browsable": item.browsable(),
+            "available": item.is_available(),
+        })
     }
 
     pub fn load_initial(&mut self, cx: &mut Context<Self>) {
@@ -354,6 +647,7 @@ impl PocketYtmApp {
                         match result {
                             Ok(status) => {
                                 this.auth_status = status;
+                                this.like_overrides.clear();
                                 this.auth_message = Some("로그인되었습니다.".into());
                                 this.load_home(cx);
                             }
@@ -390,6 +684,7 @@ impl PocketYtmApp {
                         match result {
                             Ok(status) => {
                                 this.auth_status = status;
+                                this.like_overrides.clear();
                                 this.auth_message = Some("로그인되었습니다.".into());
                                 this.load_home(cx);
                             }
@@ -424,6 +719,7 @@ impl PocketYtmApp {
                         match result {
                             Ok(status) => {
                                 this.auth_status = status;
+                                this.like_overrides.clear();
                                 this.auth_message = Some("로그아웃되었습니다.".into());
                                 this.sidebar_playlists.clear();
                                 this.sidebar_playlists_loading = false;
@@ -510,6 +806,21 @@ impl PocketYtmApp {
     }
 
     fn on_toggle_playback(&mut self, _: &TogglePlayback, _: &mut Window, _: &mut Context<Self>) {
+        self.toggle_playback();
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key != "space"
+            || self
+                .search_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self.auth_input.read(cx).focus_handle(cx).is_focused(window)
+        {
+            return;
+        }
+        cx.stop_propagation();
         self.toggle_playback();
     }
 
@@ -608,6 +919,9 @@ impl PocketYtmApp {
         }
         let changed = snapshot.phase != self.audio_snapshot.phase
             || snapshot.position.as_secs() != self.audio_snapshot.position.as_secs()
+            || snapshot.duration != self.audio_snapshot.duration
+            || snapshot.buffered_ranges != self.audio_snapshot.buffered_ranges
+            || snapshot.replacement != self.audio_snapshot.replacement
             || snapshot.generation != self.audio_snapshot.generation
             || snapshot.error != self.audio_snapshot.error;
         self.audio_snapshot = snapshot;
@@ -621,6 +935,7 @@ impl PocketYtmApp {
 
     fn load_home(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Home;
+        self.detail_source = None;
         self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.loading = true;
         self.error = None;
@@ -650,6 +965,7 @@ impl PocketYtmApp {
 
     fn load_explore(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Explore;
+        self.detail_source = None;
         self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.loading = true;
         self.error = None;
@@ -689,6 +1005,7 @@ impl PocketYtmApp {
             return;
         }
         self.page = Page::Library;
+        self.detail_source = None;
         self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.loading = true;
         self.error = None;
@@ -715,6 +1032,7 @@ impl PocketYtmApp {
 
     fn search(&mut self, query: String, cx: &mut Context<Self>) {
         self.page = Page::Search;
+        self.detail_source = None;
         self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.search_query = query.trim().to_owned();
         self.loading = true;
@@ -743,12 +1061,42 @@ impl PocketYtmApp {
 
     fn browse(&mut self, item: MediaItem, cx: &mut Context<Self>) {
         self.page = Page::Detail;
+        self.detail_source = Some(item.clone());
         self.content_image_generation = self.content_image_generation.wrapping_add(1);
         self.detail = None;
         self.loading = true;
         self.error = None;
         let backend = self.backend.clone();
-        let task = cx.background_spawn(async move { backend.browse(&item) });
+        let audio = self.audio.clone();
+        let task = cx.background_spawn(async move {
+            match backend.browse(&item) {
+                Ok(detail) => Ok(detail),
+                Err(primary) if item.kind == "playlist" => {
+                    let playlist_id = item.youtube_playlist_id().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "플레이리스트 상세 정보가 없고 공개 YouTube ID도 없습니다: {primary:#}"
+                        )
+                    })?;
+                    let queue = audio.public_playlist_queue(&playlist_id).map_err(|fallback| {
+                        anyhow::anyhow!(
+                            "플레이리스트 상세 정보를 불러오지 못했습니다. YouTube Music: {primary:#}; 공개 YouTube: {fallback:#}"
+                        )
+                    })?;
+                    Ok(BrowsePage {
+                        title: item.title,
+                        subtitle: item.subtitle,
+                        thumbnail: item.thumbnail,
+                        sections: vec![MediaSection {
+                            title: "노래".into(),
+                            items: queue.items,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        });
         cx.spawn(async move |weak, cx| {
             let result = task.await;
             if let Some(entity) = weak.upgrade() {
@@ -768,10 +1116,35 @@ impl PocketYtmApp {
         cx.notify();
     }
 
+    fn refresh_current_page(&mut self, cx: &mut Context<Self>) {
+        if self.loading {
+            return;
+        }
+        self.backend.invalidate_query_cache();
+        if self.auth_status.authenticated {
+            self.load_sidebar_playlists(cx);
+        }
+        match self.page {
+            Page::Home => self.load_home(cx),
+            Page::Explore => self.load_explore(cx),
+            Page::Library => self.load_library(cx),
+            Page::Search => self.search(self.search_query.clone(), cx),
+            Page::Detail => {
+                if let Some(item) = self.detail_source.clone() {
+                    self.browse(item, cx);
+                } else {
+                    self.error = Some("새로고침할 상세 항목을 찾지 못했습니다.".into());
+                    cx.notify();
+                }
+            }
+        }
+    }
+
     fn play_collection(&mut self, collection: MediaItem, cx: &mut Context<Self>) {
         self.loading = true;
         self.error = None;
         let backend = self.backend.clone();
+        let audio = self.audio.clone();
         let collection_for_query = collection.clone();
         let task = cx.background_spawn(async move {
             if collection_for_query.kind == "playlist" {
@@ -780,27 +1153,34 @@ impl PocketYtmApp {
                     .clone()
                     .or_else(|| collection_for_query.browse_id.clone())
                     .ok_or_else(|| anyhow::anyhow!("이 플레이리스트의 ID를 찾지 못했습니다."))?;
-                match backend.playlist_queue(&playlist_id) {
-                    Ok(watch) if !watch.items.is_empty() => Ok(watch.items),
-                    primary => backend
-                        .browse(&collection_for_query)
-                        .map(|detail| {
-                            detail
-                                .sections
-                                .into_iter()
-                                .flat_map(|section| section.items)
-                                .collect()
-                        })
-                        .map_err(|fallback| {
-                            anyhow::anyhow!(
-                                "플레이리스트 큐와 상세 목록을 모두 불러오지 못했습니다. 큐: {}; 상세: {fallback:#}",
-                                primary
-                                    .err()
-                                    .map(|error| format!("{error:#}"))
-                                    .unwrap_or_else(|| "빈 목록".into())
-                            )
-                        }),
-                }
+                let primary_error = match backend.playlist_queue(&playlist_id) {
+                    Ok(watch) if !watch.items.is_empty() => return Ok(watch.items),
+                    Ok(_) => "빈 목록".to_owned(),
+                    Err(error) => format!("{error:#}"),
+                };
+                let public_error = match collection_for_query
+                    .youtube_playlist_id()
+                    .map(|id| audio.public_playlist_queue(&id))
+                {
+                    Some(Ok(watch)) if !watch.items.is_empty() => return Ok(watch.items),
+                    Some(Ok(_)) => "빈 목록".to_owned(),
+                    Some(Err(error)) => format!("{error:#}"),
+                    None => "공개 YouTube 플레이리스트 ID 없음".to_owned(),
+                };
+                backend
+                    .browse(&collection_for_query)
+                    .map(|detail| {
+                        detail
+                            .sections
+                            .into_iter()
+                            .flat_map(|section| section.items)
+                            .collect()
+                    })
+                    .map_err(|fallback| {
+                        anyhow::anyhow!(
+                            "플레이리스트 큐와 상세 목록을 모두 불러오지 못했습니다. 큐: {primary_error}; 공개 YouTube: {public_error}; 상세: {fallback:#}"
+                        )
+                    })
             } else {
                 backend.browse(&collection_for_query).map(|detail| {
                     detail
@@ -845,7 +1225,16 @@ impl PocketYtmApp {
 
     fn play_item(&mut self, item: MediaItem, source_queue: Vec<MediaItem>, cx: &mut Context<Self>) {
         if !item.playable() {
-            self.browse(item, cx);
+            if item.browsable() {
+                self.browse(item, cx);
+            } else {
+                self.error = Some(if item.is_available() {
+                    "이 항목에는 재생할 영상 정보가 없습니다.".into()
+                } else {
+                    "이 곡은 YouTube Music에서 현재 사용할 수 없습니다.".into()
+                });
+                cx.notify();
+            }
             return;
         }
         let mut queue: Vec<_> = source_queue
@@ -1019,28 +1408,31 @@ impl PocketYtmApp {
             cx.notify();
             return;
         }
-        let Some(video_id) = self
-            .audio_snapshot
-            .item
-            .as_ref()
-            .and_then(|item| item.video_id.clone())
-        else {
+        let Some(item) = self.audio_snapshot.item.clone() else {
             return;
         };
-        let rating = if self.liked.remove(&video_id) {
-            "INDIFFERENT"
-        } else {
-            self.liked.insert(video_id.clone());
-            "LIKE"
+        let Some(video_id) = item.video_id.clone() else {
+            return;
         };
+        let previous_override = self.like_overrides.get(&video_id).copied();
+        let was_liked = previous_override.unwrap_or(item.liked);
+        let liked = !was_liked;
+        self.like_overrides.insert(video_id.clone(), liked);
+        let rating = if liked { "LIKE" } else { "INDIFFERENT" };
         let backend = self.backend.clone();
-        let task = cx.background_spawn(async move { backend.rate_song(&video_id, rating) });
+        let request_video_id = video_id.clone();
+        let task = cx.background_spawn(async move { backend.rate_song(&request_video_id, rating) });
         cx.spawn(async move |weak, cx| {
             if let Err(error) = task.await
                 && let Some(entity) = weak.upgrade()
             {
                 entity
                     .update(cx, |this, cx| {
+                        if let Some(previous) = previous_override {
+                            this.like_overrides.insert(video_id.clone(), previous);
+                        } else {
+                            this.like_overrides.remove(&video_id);
+                        }
                         this.error = Some(format!("좋아요를 저장하지 못했습니다: {error:#}"));
                         cx.notify();
                     })
@@ -1291,6 +1683,26 @@ impl PocketYtmApp {
             )
             .child(
                 div()
+                    .id("refresh-current-page")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(34.))
+                    .rounded_full()
+                    .bg(rgb(0x252529))
+                    .text_size(px(18.))
+                    .text_color(rgb(0xb8b8bd))
+                    .cursor_pointer()
+                    .hover(|style| style.cursor_pointer().bg(rgb(0x323237)))
+                    .child(if self.loading {
+                        Spinner::new().small().into_any_element()
+                    } else {
+                        div().child("↻").into_any_element()
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_current_page(cx))),
+            )
+            .child(
+                div()
                     .flex()
                     .items_center()
                     .w(px(480.))
@@ -1421,6 +1833,60 @@ impl PocketYtmApp {
         }
     }
 
+    fn artwork_with_playback_status(item: &MediaItem, size: f32, rounded: f32) -> AnyElement {
+        let fallback = item.fallback_searchable();
+        let unavailable = !item.playable() && !item.browsable();
+        if !fallback && !unavailable {
+            return Self::artwork(item, size, rounded);
+        }
+
+        let label = if fallback {
+            if size >= 80. {
+                "YOUTUBE 대체"
+            } else {
+                "대체"
+            }
+        } else {
+            "재생 불가"
+        };
+        let badge = div()
+            .absolute()
+            .left(px(if size >= 80. { 8. } else { 3. }))
+            .bottom(px(if size >= 80. { 8. } else { 3. }))
+            .px(px(if size >= 80. { 8. } else { 4. }))
+            .py_1()
+            .rounded_md()
+            .bg(if fallback {
+                rgba(0xff3157e6)
+            } else {
+                rgba(0x17171be6)
+            })
+            .text_size(px(if size >= 80. { 10. } else { 8. }))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(rgb(0xffffff))
+            .child(label);
+        div()
+            .relative()
+            .flex_shrink_0()
+            .size(px(size))
+            .rounded(px(rounded))
+            .overflow_hidden()
+            .child(Self::artwork(item, size, rounded))
+            .when(unavailable, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(rgba(0x00000088)),
+                )
+            })
+            .child(badge)
+            .into_any_element()
+    }
+
     fn render_card(
         item: MediaItem,
         source_queue: Vec<MediaItem>,
@@ -1428,6 +1894,7 @@ impl PocketYtmApp {
     ) -> AnyElement {
         let click_item = item.clone();
         let is_collection = matches!(item.kind.as_str(), "playlist" | "album" | "single");
+        let actionable = item.playable() || item.browsable();
         let artwork = if is_collection {
             let play_item = item.clone();
             let hover_group =
@@ -1486,7 +1953,11 @@ impl PocketYtmApp {
                 )
                 .into_any_element()
         } else {
-            Self::artwork(&item, 152., if item.kind == "artist" { 76. } else { 8. })
+            Self::artwork_with_playback_status(
+                &item,
+                152.,
+                if item.kind == "artist" { 76. } else { 8. },
+            )
         };
         let details = div()
             .id(SharedString::from(format!(
@@ -1494,8 +1965,9 @@ impl PocketYtmApp {
                 item.kind, item.id
             )))
             .w_full()
-            .cursor_pointer()
-            .hover(|style| style.cursor_pointer())
+            .when(actionable, |this| {
+                this.cursor_pointer().hover(|style| style.cursor_pointer())
+            })
             .child(
                 div()
                     .mt_3()
@@ -1532,7 +2004,9 @@ impl PocketYtmApp {
             .p_2()
             .rounded_xl()
             .overflow_hidden()
-            .hover(|style| style.cursor_pointer().bg(rgb(0x222226)))
+            .when(actionable, |this| {
+                this.hover(|style| style.cursor_pointer().bg(rgb(0x222226)))
+            })
             .child(artwork);
         if is_collection {
             card.child(details.on_click(cx.listener(move |this, _, _, cx| {
@@ -1540,7 +2014,7 @@ impl PocketYtmApp {
                 this.browse(click_item.clone(), cx);
             })))
             .into_any_element()
-        } else {
+        } else if actionable {
             card.cursor_pointer()
                 .child(details)
                 .on_mouse_up(
@@ -1551,6 +2025,8 @@ impl PocketYtmApp {
                     }),
                 )
                 .into_any_element()
+        } else {
+            card.child(details).into_any_element()
         }
     }
 
@@ -1561,8 +2037,16 @@ impl PocketYtmApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let click_item = item.clone();
+        let actionable = item.playable() || item.browsable();
         let duration = item.duration_seconds.map(format_time).unwrap_or_default();
-        div()
+        let status = if item.fallback_searchable() {
+            "YOUTUBE 대체".into()
+        } else if item.is_available() {
+            item.kind.to_uppercase()
+        } else {
+            "사용 불가".into()
+        };
+        let row = div()
             .id(SharedString::from(format!("row-{index}-{}", item.id)))
             .flex()
             .items_center()
@@ -1570,8 +2054,10 @@ impl PocketYtmApp {
             .px_3()
             .gap_4()
             .rounded_lg()
-            .hover(|style| style.cursor_pointer().bg(rgb(0x222226)))
-            .cursor_pointer()
+            .when(actionable, |this| {
+                this.hover(|style| style.cursor_pointer().bg(rgb(0x222226)))
+                    .cursor_pointer()
+            })
             .child(
                 div()
                     .w(px(24.))
@@ -1584,7 +2070,7 @@ impl PocketYtmApp {
                         "•".into()
                     }),
             )
-            .child(Self::artwork(
+            .child(Self::artwork_with_playback_status(
                 &item,
                 48.,
                 if item.kind == "artist" { 24. } else { 5. },
@@ -1617,7 +2103,7 @@ impl PocketYtmApp {
                     .w(px(90.))
                     .text_size(px(11.))
                     .text_color(rgb(0x6f6f76))
-                    .child(item.kind.to_uppercase()),
+                    .child(status),
             )
             .child(
                 div()
@@ -1626,8 +2112,9 @@ impl PocketYtmApp {
                     .text_size(px(12.))
                     .text_color(rgb(0x8a8a91))
                     .child(duration),
-            )
-            .on_mouse_up(
+            );
+        if actionable {
+            row.on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
@@ -1635,6 +2122,9 @@ impl PocketYtmApp {
                 }),
             )
             .into_any_element()
+        } else {
+            row.into_any_element()
+        }
     }
 
     fn render_sections(&self, sections: Vec<MediaSection>, cx: &mut Context<Self>) -> AnyElement {
@@ -2609,7 +3099,8 @@ impl PocketYtmApp {
         let liked = item
             .video_id
             .as_ref()
-            .is_some_and(|id| self.liked.contains(id));
+            .and_then(|id| self.like_overrides.get(id).copied())
+            .unwrap_or(item.liked);
         let playback_ratio = if state.duration.is_zero() {
             0.0
         } else {
@@ -2647,9 +3138,47 @@ impl PocketYtmApp {
                 .mt_1()
                 .truncate()
                 .text_size(px(11.))
-                .text_color(rgb(0x88888f))
-                .child(item.subtitle.clone())
+                .text_color(if state.replacement.is_some() {
+                    rgb(0xff8ca0)
+                } else {
+                    rgb(0x88888f)
+                })
+                .child(
+                    state
+                        .replacement
+                        .as_ref()
+                        .map(|replacement| {
+                            format!(
+                                "YouTube 대체: {} · {}",
+                                replacement.title, replacement.video_id
+                            )
+                        })
+                        .unwrap_or_else(|| item.subtitle.clone()),
+                )
                 .into_any_element(),
+        };
+        let buffered_segments = if state.duration.is_zero() {
+            Vec::new()
+        } else {
+            let duration = state.duration.as_secs_f64();
+            state
+                .buffered_ranges
+                .iter()
+                .filter_map(|range| {
+                    let start = (range.start.as_secs_f64() / duration).clamp(0.0, 1.0);
+                    let end = (range.end.as_secs_f64() / duration).clamp(start, 1.0);
+                    (end > start).then(|| {
+                        div()
+                            .absolute()
+                            .left(relative(start as f32))
+                            .top(px(5.))
+                            .h(px(4.))
+                            .w(relative((end - start) as f32))
+                            .bg(rgb(0x85858d))
+                            .into_any_element()
+                    })
+                })
+                .collect::<Vec<_>>()
         };
         let mut seek_targets = Vec::new();
         for index in 0..128 {
@@ -2718,8 +3247,9 @@ impl PocketYtmApp {
                             .top(px(5.))
                             .h(px(4.))
                             .w_full()
-                            .bg(rgb(0x424248)),
+                            .bg(rgb(0x303036)),
                     )
+                    .children(buffered_segments)
                     .child(
                         div()
                             .absolute()
@@ -2972,6 +3502,7 @@ impl Render for PocketYtmApp {
         div()
             .relative()
             .key_context("PocketYtm")
+            .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::on_toggle_playback))
             .on_action(cx.listener(Self::on_next_track))
             .on_action(cx.listener(Self::on_previous_track))

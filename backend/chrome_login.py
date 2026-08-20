@@ -25,6 +25,14 @@ START_TIMEOUT_SECONDS = 15
 LOGIN_TIMEOUT_SECONDS = 5 * 60
 CAPTURE_TIMEOUT_SECONDS = 10
 LOGIN_COOKIE = "__Secure-3PAPISID"
+GOOGLE_LOGIN_URL_PATTERN = "https://accounts.google.com/%"
+LOGIN_DESTINATION_URL_PATTERNS = (
+    "https://music.youtube.com/%",
+    "https://www.youtube.com/%",
+    "https://youtube.com/%",
+    "https://myaccount.google.com/%",
+    "https://www.google.com/%",
+)
 
 
 class ChromeLoginError(RuntimeError):
@@ -216,12 +224,44 @@ def has_youtube_login_cookie(profile: Path) -> bool:
     return False
 
 
+def has_completed_google_login(profile: Path) -> bool:
+    """Detect a post-login redirect without attaching automation to Chrome."""
+    database = profile / "Default/History"
+    if not database.is_file():
+        return False
+    try:
+        connection = sqlite3.connect(
+            f"{database.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=0.1,
+        )
+        try:
+            destination_conditions = " OR ".join(
+                "url LIKE ?" for _ in LOGIN_DESTINATION_URL_PATTERNS
+            )
+            login_time, destination_time = connection.execute(
+                "SELECT "
+                "MAX(CASE WHEN url LIKE ? THEN last_visit_time END), "
+                f"MAX(CASE WHEN {destination_conditions} THEN last_visit_time END) "
+                f"FROM urls WHERE url LIKE ? OR {destination_conditions}",
+                (GOOGLE_LOGIN_URL_PATTERN,)
+                + LOGIN_DESTINATION_URL_PATTERNS
+                + (GOOGLE_LOGIN_URL_PATTERN,)
+                + LOGIN_DESTINATION_URL_PATTERNS,
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return False
+    return bool(login_time and destination_time and destination_time > login_time)
+
+
 def _wait_for_interactive_login(
     profile: Path, process: subprocess.Popen[bytes], timeout: float
 ) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if has_youtube_login_cookie(profile):
+        if has_youtube_login_cookie(profile) or has_completed_google_login(profile):
             # Let Chrome finish the cookie transaction before terminating the
             # temporary interactive instance and reopening the same profile.
             time.sleep(0.5)

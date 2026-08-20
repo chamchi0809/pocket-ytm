@@ -7,6 +7,8 @@ python_bin=${POCKET_YTM_BUILD_PYTHON:-"$project_dir/.venv/bin/python"}
 jobs=${POCKET_YTM_BUILD_JOBS:-3}
 
 yt_dlp_version=2026.07.04
+pot_provider_version=1.3.1
+pot_provider_sha256=b5400343482820062372e997cc0c9ace18637f8e774cf70b22c58b89b99e9abe
 deno_version=2.9.5
 deno_sha256=b796aadd131f6930560c1ee040cf0d6f53933fbb987464e9ff46bd7ea4830615
 ffmpeg_version=9.0.1
@@ -28,7 +30,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-install -d "$output_dir/bin" "$output_dir/libexec" "$output_dir/licenses"
+install -d "$output_dir/bin" "$output_dir/libexec" "$output_dir/licenses" "$output_dir/share"
 
 "$python_bin" -m pip install --disable-pip-version-check -r "$project_dir/requirements-build-macos.txt"
 
@@ -84,6 +86,32 @@ ditto \
     "$output_dir/libexec/pocket-ytm-resolver"
 chmod 755 "$output_dir/libexec/pocket-ytm-resolver/pocket-ytm-resolver"
 
+pot_provider_archive="$work_dir/bgutil-ytdlp-pot-provider.tar.gz"
+download \
+    "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/$pot_provider_version.tar.gz" \
+    "$pot_provider_archive"
+verify_sha256 "$pot_provider_sha256" "$pot_provider_archive"
+tar -xzf "$pot_provider_archive" -C "$work_dir"
+pot_provider_source="$work_dir/bgutil-ytdlp-pot-provider-$pot_provider_version"
+patch -d "$pot_provider_source" -p1 \
+    < "$project_dir/packaging/patches/bgutil-deno-offline.patch"
+(
+    cd "$pot_provider_source/server"
+    npm ci --omit=dev --no-audit --no-fund
+)
+pot_plugin_archive="$work_dir/bgutil-ytdlp-pot-provider.zip"
+(
+    cd "$pot_provider_source/plugin"
+    zip -q -r "$pot_plugin_archive" yt_dlp_plugins
+)
+install -d "$output_dir/libexec/pocket-ytm-resolver/yt-dlp-plugins"
+install -m 644 \
+    "$pot_plugin_archive" \
+    "$output_dir/libexec/pocket-ytm-resolver/yt-dlp-plugins/bgutil-ytdlp-pot-provider.zip"
+rm -rf "$pot_provider_source/server/node_modules/.bin"
+rm -rf "$output_dir/share/bgutil-ytdlp-pot-provider"
+ditto "$pot_provider_source" "$output_dir/share/bgutil-ytdlp-pot-provider"
+
 deno_archive="$work_dir/deno.zip"
 download \
     "https://github.com/denoland/deno/releases/download/v$deno_version/deno-aarch64-apple-darwin.zip" \
@@ -136,6 +164,18 @@ download \
 download \
     "https://raw.githubusercontent.com/websocket-client/websocket-client/v1.9.0/LICENSE" \
     "$output_dir/licenses/websocket-client-Apache-2.0.txt"
+install -m 644 \
+    "$pot_provider_source/LICENSE" \
+    "$output_dir/licenses/bgutil-ytdlp-pot-provider-GPL-3.0.txt"
+
+canvas_module="$output_dir/share/bgutil-ytdlp-pot-provider/server/node_modules/canvas/build/Release/canvas.node"
+test -f "$canvas_module"
+lipo "$canvas_module" -verify_arch arm64
+if otool -L "$canvas_module" | tail -n +2 | grep -E '/opt/homebrew|/usr/local|/Users/' >/dev/null; then
+    echo "$canvas_module links a non-bundled dependency" >&2
+    otool -L "$canvas_module" >&2
+    exit 1
+fi
 
 for binary in \
     "$output_dir/libexec/pocket-ytm-bridge/pocket-ytm-bridge" \
@@ -155,6 +195,7 @@ done
 {
     echo "ytmusicapi=1.12.2"
     echo "yt-dlp=$yt_dlp_version"
+    echo "bgutil-ytdlp-pot-provider=$pot_provider_version"
     echo "websocket-client=1.9.0"
     echo "deno=$deno_version"
     echo "ffmpeg=$ffmpeg_version"

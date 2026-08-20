@@ -10,6 +10,9 @@ need Python, Homebrew, yt-dlp, FFmpeg, or a JavaScript runtime installed.
   optional bundled components retain their respective upstream licenses
 - FFmpeg 9.0.1 built without GPL or external libraries — LGPL-2.1-or-later
 - Deno 2.9.5 — MIT
+- bgutil-ytdlp-pot-provider 1.3.1 — GPL-3.0-only; the provider source and
+  production JavaScript dependency notices are included in
+  `Resources/share/bgutil-ytdlp-pot-provider`
 
 The corresponding upstream license files are included beside this notice.
 Project sources:
@@ -20,3 +23,4 @@ Project sources:
 - https://github.com/yt-dlp/yt-dlp
 - https://ffmpeg.org/
 - https://github.com/denoland/deno
+- https://github.com/Brainicism/bgutil-ytdlp-pot-provider

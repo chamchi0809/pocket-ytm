@@ -62,6 +62,10 @@ impl YtMusicBridge {
         cached_auth_status(&self.config.auth_path)
     }
 
+    pub fn invalidate_query_cache(&self) {
+        self.query_cache.lock().clear();
+    }
+
     pub fn authenticate(&self, headers: &str) -> Result<AccountStatus> {
         self.mutation("authenticate", json!({"headers": headers}))
     }

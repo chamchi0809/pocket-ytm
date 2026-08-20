@@ -3,9 +3,11 @@ from unittest.mock import patch
 
 from ytmusic_bridge import (
     Service,
+    detail_page,
     item_thumbnail,
     normalize_auth_input,
     normalize_item,
+    normalize_items,
     thumbnail,
 )
 
@@ -69,11 +71,17 @@ class NormalizeMediaItemTests(unittest.TestCase):
 
     def test_watch_queue_length_is_preserved_for_end_detection(self) -> None:
         item = normalize_item(
-            {"title": "Queue track", "videoId": "video", "length": "3:29"},
+            {
+                "title": "Queue track",
+                "videoId": "video",
+                "length": "3:29",
+                "likeStatus": "LIKE",
+            },
             "song",
         )
 
         self.assertEqual(item["durationSeconds"], 209)
+        self.assertTrue(item["liked"])
 
     def test_track_thumbnail_falls_back_to_the_video_endpoint(self) -> None:
         self.assertEqual(
@@ -81,6 +89,53 @@ class NormalizeMediaItemTests(unittest.TestCase):
             "https://i.ytimg.com/vi/abc_123-Z/hqdefault.jpg",
         )
         self.assertIsNone(item_thumbnail({}, "not/a/video/id"))
+
+    def test_unavailable_catalog_track_is_preserved_as_unavailable(self) -> None:
+        item = normalize_item(
+            {
+                "title": "Unavailable single",
+                "videoId": None,
+                "isAvailable": False,
+            },
+            "song",
+        )
+
+        self.assertIsNotNone(item)
+        self.assertFalse(item["available"])
+        self.assertIsNone(item["videoId"])
+
+    def test_collection_provenance_preserves_original_indexes(self) -> None:
+        items = normalize_items(
+            [None, {"title": "Track", "videoId": None}],
+            "song",
+            source_playlist_id="OLAK5uy_exact",
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["sourcePlaylistId"], "OLAK5uy_exact")
+        self.assertEqual(items[0]["sourceIndex"], 1)
+
+    def test_album_tracks_use_the_official_audio_playlist_as_provenance(self) -> None:
+        page = detail_page(
+            {
+                "title": "maybe!",
+                "audioPlaylistId": "OLAK5uy_exact",
+                "tracks": [
+                    {
+                        "title": "きっとね！ - maybe!",
+                        "artists": [{"name": "Eye"}, {"name": "Muto"}],
+                        "duration_seconds": 250,
+                        "videoId": None,
+                        "isAvailable": False,
+                    }
+                ],
+            },
+            "single",
+        )
+
+        track = page["sections"][0]["items"][0]
+        self.assertEqual(track["sourcePlaylistId"], "OLAK5uy_exact")
+        self.assertEqual(track["sourceIndex"], 0)
 
 
 class LibraryOrderingTests(unittest.TestCase):
@@ -131,6 +186,13 @@ class UnauthenticatedFallbackTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "플레이리스트의 ID"):
             service.dispatch("browse", {"kind": "playlist"})
+
+    def test_unavailable_song_is_not_misrouted_as_a_playlist(self) -> None:
+        service = Service.__new__(Service)
+        service.yt = object()
+
+        with self.assertRaisesRegex(ValueError, "상세 페이지"):
+            service.dispatch("browse", {"kind": "song"})
 
 
 class SavedAuthenticationTests(unittest.TestCase):

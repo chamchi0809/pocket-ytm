@@ -44,6 +44,11 @@ jobs:
             requirements.txt
             requirements-build-macos.txt
 
+      - name: Set up Node for bundled PO token provider
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Validate release version
         id: version
         shell: bash
@@ -85,7 +90,7 @@ jobs:
       - name: Build Apple Silicon release
         run: >-
           cargo build --release --target aarch64-apple-darwin
-          --bin pocket-ytm --bin pocket-ytm-updater
+          --bin pocket-ytm --bin pocket-ytm-updater --bin pocket-ytm-e2e
 
       - name: Build self-contained runtime dependencies
         env:
@@ -140,9 +145,22 @@ jobs:
           done
           PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/bin/ffmpeg' -version
           PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/bin/deno' --version
+          provider='dist/Pocket Music.app/Contents/Resources/share/bgutil-ytdlp-pot-provider/server'
+          test -f "$provider/src/generate_once.ts"
+          test -f "$provider/node_modules/canvas/build/Release/canvas.node"
+          lipo "$provider/node_modules/canvas/build/Release/canvas.node" -verify_arch arm64
+          XDG_CACHE_HOME="$RUNNER_TEMP" PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/bin/deno' run \
+            --node-modules-dir=manual \
+            --no-lock \
+            --allow-env \
+            --allow-net \
+            --allow-ffi="$provider/node_modules" \
+            --allow-read="$provider/node_modules,$RUNNER_TEMP" \
+            --allow-write="$RUNNER_TEMP" \
+            "$provider/src/generate_once.ts" --version
           response=$(printf '%s\n' '{"id":1,"op":"authStatus","params":{}}' | PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/libexec/pocket-ytm-bridge/pocket-ytm-bridge' --language ko --location KR --auth "$RUNNER_TEMP/pocket-music-test-auth.json")
           python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert value["id"] == 1 and value["ok"]' "$response"
-          resolver_response=$(printf '%s\n' '{"id":1,"op":"ping"}' | PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/libexec/pocket-ytm-resolver/pocket-ytm-resolver' --deno 'dist/Pocket Music.app/Contents/Resources/bin/deno')
+          resolver_response=$(printf '%s\n' '{"id":1,"op":"ping"}' | PATH=/usr/bin:/bin 'dist/Pocket Music.app/Contents/Resources/libexec/pocket-ytm-resolver/pocket-ytm-resolver' --deno 'dist/Pocket Music.app/Contents/Resources/bin/deno' --pot-provider "$provider")
           python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert value["id"] == 1 and value["ok"] and value["data"]["version"] == "2026.07.04"' "$resolver_response"
 
       - name: Archive app

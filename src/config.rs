@@ -8,6 +8,7 @@ pub struct AppConfig {
     pub media_resolver: PathBuf,
     pub ffmpeg: String,
     pub deno: Option<String>,
+    pub pot_provider: Option<PathBuf>,
     pub cookies_path: Option<PathBuf>,
     pub language: String,
     pub location: String,
@@ -56,6 +57,14 @@ impl AppConfig {
                 .or_else(|| {
                     bundled_tool_path("deno").map(|path| path.to_string_lossy().into_owned())
                 }),
+            pot_provider: path_env("POCKET_YTM_POT_PROVIDER")
+                .filter(|path| path.is_dir())
+                .or_else(|| bundled_resource_dir("bgutil-ytdlp-pot-provider/server"))
+                .or_else(|| {
+                    let path = manifest
+                        .join("target/macos-dependencies/share/bgutil-ytdlp-pot-provider/server");
+                    path.is_dir().then_some(path)
+                }),
             cookies_path,
             language: std::env::var("POCKET_YTM_LANGUAGE").unwrap_or_else(|_| "ko".into()),
             location: std::env::var("POCKET_YTM_LOCATION").unwrap_or_else(|_| "KR".into()),
@@ -74,6 +83,23 @@ fn tool_from_env_or_bundle(variable: &str, bundled_name: &str, fallback: &str) -
 pub(crate) fn bundled_tool_path(name: &str) -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     bundled_tool_path_for_executable(&executable, name).filter(|path| path.is_file())
+}
+
+fn bundled_resource_dir(name: &str) -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    bundled_resource_dir_for_executable(&executable, name).filter(|path| path.is_dir())
+}
+
+fn bundled_resource_dir_for_executable(
+    executable: &std::path::Path,
+    name: &str,
+) -> Option<PathBuf> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    if macos.file_name()? != "MacOS" || contents.file_name()? != "Contents" {
+        return None;
+    }
+    Some(contents.join("Resources/share").join(name))
 }
 
 fn bundled_tool_path_for_executable(executable: &std::path::Path, name: &str) -> Option<PathBuf> {
@@ -150,6 +176,12 @@ mod tests {
             bundled_tool_path_for_executable(&executable, "ffmpeg"),
             Some(PathBuf::from(
                 "/Applications/Pocket Music.app/Contents/Resources/bin/ffmpeg"
+            ))
+        );
+        assert_eq!(
+            bundled_resource_dir_for_executable(&executable, "bgutil-ytdlp-pot-provider/server"),
+            Some(PathBuf::from(
+                "/Applications/Pocket Music.app/Contents/Resources/share/bgutil-ytdlp-pot-provider/server"
             ))
         );
         assert_eq!(

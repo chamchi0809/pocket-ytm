@@ -30,7 +30,8 @@ macOS가 첫 실행을 막으면 Finder에서 앱을 우클릭해 `열기`를 �
 
 ## 로그인
 
-로그인 없이도 홈, 둘러보기, 검색을 사용할 수 있으며 재생 가능한 영상은 광고 없이 들을 수 있습니다. 다만 비로그인 재생은 YouTube의 제한을 받을 수 있습니다. 앱의 YouTube Music 로그인 기능은 Premium 계정만 지원하며, 로그인하면 보관함과 좋아요를 사용할 수 있습니다.
+로그인 없이도 홈, 둘러보기, 검색을 사용할 수 있으며 재생 가능한 영상은 광고 없이 들을 수 있습니다. 다만 비로그인 재생은 YouTube의 제한을 받을 수 있습니다.
+앱의 YouTube Music 로그인 기능은 모든 유튜브 계정을 지원하며, 로그인하면 보관함과 좋아요를 사용할 수 있습니다.
 
 `Google로 빠르게 로그인`을 누르면 자동화 옵션 없는 Pocket Music 전용 Chrome 창이 열립니다. Google 로그인이 완료되면 앱이 이를 감지하고, 같은 임시 프로필의 로그인 쿠키로 자동 연결한 뒤 프로필을 삭제합니다. 완료 후에도 계속 기다린다면 로그인 창을 완전히 닫으면 즉시 다음 단계로 넘어갑니다. Chrome, Edge, Brave 또는 Chromium을 찾지 못하면 아래 수동 방식을 사용할 수 있습니다.
 
@@ -79,17 +80,17 @@ git push origin v0.2.0
 
 ### 환경 변수
 
-| 변수                  | 용도                            |
-| --------------------- | ------------------------------- |
-| `POCKET_YTM_AUTH`     | ytmusicapi 인증 파일 경로       |
-| `POCKET_YTM_COOKIES`  | 재생용 쿠키 파일 경로           |
-| `POCKET_YTM_BRIDGE`   | ytmusicapi 브리지 override      |
-| `POCKET_YTM_RESOLVER` | yt-dlp resolver override        |
-| `POCKET_YTM_FFMPEG`   | FFmpeg override                 |
-| `POCKET_YTM_DENO`     | Deno override                   |
+| 변수                  | 용도                                 |
+| --------------------- | ------------------------------------ |
+| `POCKET_YTM_AUTH`     | ytmusicapi 인증 파일 경로            |
+| `POCKET_YTM_COOKIES`  | 재생용 쿠키 파일 경로                |
+| `POCKET_YTM_BRIDGE`   | ytmusicapi 브리지 override           |
+| `POCKET_YTM_RESOLVER` | yt-dlp resolver override             |
+| `POCKET_YTM_FFMPEG`   | FFmpeg override                      |
+| `POCKET_YTM_DENO`     | Deno override                        |
 | `POCKET_YTM_BROWSER`  | 빠른 로그인용 Chromium 브라우저 경로 |
-| `POCKET_YTM_LANGUAGE` | YouTube Music 언어, 기본값 `ko` |
-| `POCKET_YTM_LOCATION` | YouTube Music 국가, 기본값 `KR` |
+| `POCKET_YTM_LANGUAGE` | YouTube Music 언어, 기본값 `ko`      |
+| `POCKET_YTM_LOCATION` | YouTube Music 국가, 기본값 `KR`      |
 
 ## 호환성
 

@@ -15,7 +15,9 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::AppConfig;
+use crate::{config::AppConfig, model::WatchQueue};
+
+pub const RESOLVER_PROFILE_COUNT: usize = 2;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,12 +26,17 @@ pub struct ResolvedMedia {
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     pub duration_seconds: Option<f64>,
+    #[serde(default)]
+    pub video_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 pub struct MediaResolver {
     python: String,
     entrypoint: PathBuf,
     deno: Option<String>,
+    pot_provider: Option<PathBuf>,
     cookies: Option<PathBuf>,
     process: Mutex<Option<ResolverSidecar>>,
     next_id: AtomicU64,
@@ -57,6 +64,7 @@ impl MediaResolver {
             python: config.python.clone(),
             entrypoint: config.media_resolver.clone(),
             deno: config.deno.clone(),
+            pot_provider: config.pot_provider.clone(),
             cookies: config.cookies_path.clone(),
             process: Mutex::new(None),
             next_id: AtomicU64::new(1),
@@ -75,9 +83,60 @@ impl MediaResolver {
             .expect("failed to start resolver warm-up thread");
     }
 
-    pub fn resolve(&self, url: &str, format: &str) -> Result<ResolvedMedia> {
-        let value = self.request("resolve", json!({"url": url, "format": format}))?;
+    pub fn resolve_profile(
+        &self,
+        url: &str,
+        format: &str,
+        profile: usize,
+    ) -> Result<ResolvedMedia> {
+        let value = self.request(
+            "resolve",
+            json!({"url": url, "format": format, "profile": profile}),
+        )?;
         serde_json::from_value(value).context("yt-dlp resolver 응답 형식이 올바르지 않습니다")
+    }
+
+    pub fn search_profile(
+        &self,
+        query: &str,
+        format: &str,
+        profile: usize,
+    ) -> Result<ResolvedMedia> {
+        let value = self.request(
+            "searchResolve",
+            json!({"query": query, "format": format, "profile": profile}),
+        )?;
+        serde_json::from_value(value).context("yt-dlp 대체 검색 응답 형식이 올바르지 않습니다")
+    }
+
+    pub fn playlist_queue(&self, playlist_id: &str, limit: usize) -> Result<WatchQueue> {
+        let mut failures = Vec::new();
+        for profile in 0..RESOLVER_PROFILE_COUNT {
+            let value = match self.request(
+                "playlistResolve",
+                json!({
+                    "playlistId": playlist_id,
+                    "limit": limit,
+                    "profile": profile,
+                }),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    failures.push(format!("프로필 {}: {error:#}", profile + 1));
+                    continue;
+                }
+            };
+            let queue: WatchQueue = serde_json::from_value(value)
+                .context("yt-dlp 플레이리스트 응답 형식이 올바르지 않습니다")?;
+            if !queue.items.is_empty() {
+                return Ok(queue);
+            }
+            failures.push(format!("프로필 {}: 빈 플레이리스트", profile + 1));
+        }
+        bail!(
+            "공개 YouTube 플레이리스트를 불러오지 못했습니다: {}",
+            failures.join(" | ")
+        )
     }
 
     fn request(&self, operation: &str, fields: Value) -> Result<Value> {
@@ -136,6 +195,9 @@ impl MediaResolver {
         };
         if let Some(deno) = &self.deno {
             command.arg("--deno").arg(deno);
+        }
+        if let Some(provider) = &self.pot_provider {
+            command.arg("--pot-provider").arg(provider);
         }
         if let Some(cookies) = &self.cookies {
             command.arg("--cookies").arg(cookies);

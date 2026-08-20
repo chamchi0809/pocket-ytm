@@ -229,14 +229,29 @@ def normalize_item(raw: Any, fallback_kind: str = "unknown") -> dict[str, Any] |
         "durationSeconds": parse_duration(
             raw.get("duration_seconds") or raw.get("duration") or raw.get("length")
         ),
+        "available": raw.get("isAvailable") is not False,
         "explicit": bool(raw.get("isExplicit") or raw.get("explicit")),
+        "liked": text(raw.get("likeStatus")).upper() == "LIKE",
     }
 
 
-def normalize_items(values: Any, fallback_kind: str = "unknown") -> list[dict[str, Any]]:
+def normalize_items(
+    values: Any,
+    fallback_kind: str = "unknown",
+    source_playlist_id: str | None = None,
+) -> list[dict[str, Any]]:
     if not isinstance(values, list):
         return []
-    return [item for raw in values if (item := normalize_item(raw, fallback_kind)) is not None]
+    result: list[dict[str, Any]] = []
+    for source_index, raw in enumerate(values):
+        item = normalize_item(raw, fallback_kind)
+        if item is None:
+            continue
+        if source_playlist_id:
+            item["sourcePlaylistId"] = source_playlist_id
+            item["sourceIndex"] = source_index
+        result.append(item)
+    return result
 
 
 def normalize_sections(values: Any) -> list[dict[str, Any]]:
@@ -265,7 +280,22 @@ def detail_page(raw: dict[str, Any], kind: str) -> dict[str, Any]:
     sections: list[dict[str, Any]] = []
     tracks = raw.get("tracks") or raw.get("songs")
     if tracks:
-        sections.append({"title": "노래", "subtitle": "", "items": normalize_items(tracks, "song")})
+        source_playlist_id = text(
+            raw.get("audioPlaylistId")
+            or raw.get("playlistId")
+            or (raw.get("id") if kind == "playlist" else None)
+        )
+        sections.append(
+            {
+                "title": "노래",
+                "subtitle": "",
+                "items": normalize_items(
+                    tracks,
+                    "song",
+                    source_playlist_id=source_playlist_id or None,
+                ),
+            }
+        )
 
     for key, title in (
         ("albums", "앨범"),
@@ -496,20 +526,30 @@ class Service:
             raw = self.yt.get_watch_playlist(
                 videoId=video_id, limit=int(params.get("limit", 50))
             )
+            source_playlist_id = text(raw.get("playlistId"))
             return {
                 "playlistId": raw.get("playlistId"),
                 "lyricsBrowseId": raw.get("lyrics"),
-                "items": normalize_items(raw.get("tracks"), "song"),
+                "items": normalize_items(
+                    raw.get("tracks"),
+                    "song",
+                    source_playlist_id=source_playlist_id or None,
+                ),
             }
         if op == "playlistQueue":
             self.require_auth()
             raw = self.yt.get_watch_playlist(
                 playlistId=params["playlistId"], limit=int(params.get("limit", 50))
             )
+            source_playlist_id = text(raw.get("playlistId") or params["playlistId"])
             return {
-                "playlistId": raw.get("playlistId") or params["playlistId"],
+                "playlistId": source_playlist_id,
                 "lyricsBrowseId": raw.get("lyrics"),
-                "items": normalize_items(raw.get("tracks"), "song"),
+                "items": normalize_items(
+                    raw.get("tracks"),
+                    "song",
+                    source_playlist_id=source_playlist_id,
+                ),
             }
         if op == "browse":
             kind = text(params.get("kind")).lower()
@@ -523,11 +563,13 @@ class Service:
                 if not browse_id:
                     raise ValueError("앨범의 ID가 없습니다.")
                 raw = self.yt.get_album(browse_id)
-            else:
+            elif kind == "playlist":
                 identifier = playlist_id or browse_id
                 if not identifier:
                     raise ValueError("플레이리스트의 ID가 없습니다.")
                 raw = self.yt.get_playlist(identifier, limit=100)
+            else:
+                raise ValueError("이 콘텐츠에는 열 수 있는 상세 페이지가 없습니다.")
             return detail_page(raw, kind)
         if op == "lyrics":
             raw = self.yt.get_lyrics(params["browseId"], timestamps=False) or {}
